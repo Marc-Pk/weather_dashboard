@@ -151,7 +151,6 @@ def get_outdoor_weather():
 
 
     if GATHER_DATA:
-        # Setup the Open-Meteo API client with cache and retry on error
         cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
         retry_session = retry(cache_session, retries=1, backoff_factor=0.2)
         openmeteo = openmeteo_requests.Client(session=retry_session)
@@ -314,7 +313,7 @@ def update_daily_graph(granularity, time_range, aggregation_chart_selector, incl
         "Humidity_outdoor": {"color": (0, 190, 255), "range": hum_range}
     }
 
-    # fade from white to the color_dict by the number of days day
+    # fade from white to the color_dict values by the number of days
     def fade_to_white(color, day_index, n_days):
         # Interpolate each RGB component towards 255
         return tuple(
