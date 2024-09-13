@@ -6,7 +6,9 @@ A simple weather monitoring system using the ENS160+AHT21 sensor. Measurements a
 - Real-time display of indoor temperature, humidity, and eCO2 levels
 - Integration with outdoor weather data
 - Multiple visualization options with adjustable time ranges and granularity
-
+![weather_dashboard_3](https://github.com/user-attachments/assets/8e0bcacc-5f5a-46bb-9f2d-7ec137f032e3)
+![weather_dashboard_2](https://github.com/user-attachments/assets/898264f0-1d34-43da-888e-4dfe1d7d7dd6)
+![weather_dashboard_1](https://github.com/user-attachments/assets/31d14e7d-6abc-4a5d-8da3-0da8eb30e42c)
 ## Setup
 
 1. Clone this repository:
@@ -14,6 +16,7 @@ A simple weather monitoring system using the ENS160+AHT21 sensor. Measurements a
 2. Install the required Python packages with 
 
     ```
+
    pip install -r requirements.txt
    ```
 
