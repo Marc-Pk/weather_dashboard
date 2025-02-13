@@ -1,0 +1,3 @@
+adafruit-circuitpython-ens160
+adafruit-circuitpython-ahtx0
+boto3

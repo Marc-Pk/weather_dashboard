@@ -1,0 +1,11 @@
+dash
+dash_bootstrap_components
+Flask_Caching
+openmeteo_requests
+pandas
+plotly
+pytz
+requests_cache
+retry_requests
+boto3
+pyarrow

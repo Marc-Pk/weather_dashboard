@@ -1,22 +1,125 @@
-import dash
-import plotly.graph_objects as go
-import dash_bootstrap_components as dbc
-import plotly.io as pio
-import sqlite3
-import openmeteo_requests
-import requests_cache
-import pandas as pd
-from dash import dcc, html
-from dash.dependencies import Output, Input
-from plotly.subplots import make_subplots
-from config import *
-from flask_caching import Cache
-from retry_requests import retry
-from datetime import datetime, timedelta
-import pytz
 import warnings
-warnings.simplefilter("ignore", UserWarning)
-warnings.simplefilter("ignore", FutureWarning)
+with warnings.catch_warnings(action='ignore'):
+    import dash
+    import plotly.graph_objects as go
+    import dash_bootstrap_components as dbc
+    import plotly.io as pio
+    import sqlite3
+    import openmeteo_requests
+    import requests_cache
+    import pandas as pd
+    import pytz
+    import boto3
+    import os
+    from dash import dcc, html
+    from dash.dependencies import Output, Input
+    from plotly.subplots import make_subplots
+    from flask_caching import Cache
+    from retry_requests import retry
+    from datetime import datetime, timedelta
+    from boto3.dynamodb.conditions import Attr
+
+########## Config values ##########
+# Either "AWS" if you are using AWS DynamoDB or "LOCAL" for a SQLite database.
+DB_TYPE = os.getenv("DB_TYPE", "AWS")
+
+# If your DB_TYPE is "AWS", enter the name of your table here
+# If your DB_TYPE is "LOCAL", enter the path to your SQLite database here and make sure to include "weather_data.db" at the end.
+DB_PATH = os.getenv("DB_PATH", r"weather-data")
+
+# Coordinates for API weather data
+LATITUDE = float(os.getenv("LATITUDE", 49.0094))
+LONGITUDE = float(os.getenv("LONGITUDE", 8.4044))
+
+# Timeout for caching of database fetches in seconds
+CACHE_TIMEOUT = int(os.getenv("CACHE_TIMEOUT", 300))
+
+class DatabaseHandler:
+    def __init__(self):
+        if DB_TYPE == "AWS":
+            self.dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+            self.table = self.dynamodb.Table(DB_PATH)
+        else:
+            self.conn = sqlite3.connect(DB_PATH)
+            
+    # Get the minimum date in the database
+    def get_min_date(self):
+        if DB_TYPE == "AWS":
+            response = self.table.scan(
+                FilterExpression=Attr("Time").gte("1970-01-01"),
+                ExpressionAttributeNames={
+                    "#ts": "Time"
+                },
+                ProjectionExpression="#ts"
+            )
+            min_date = min(item['Time'] for item in response['Items'])
+            return datetime.strptime(min_date, '%Y-%m-%d %H:%M:%S').date()
+        else:
+            query = "SELECT MIN(Time) FROM weather_data"
+            min_date = pd.read_sql_query(query, self.conn).iloc[0, 0]
+            return datetime.strptime(min_date, '%Y-%m-%d %H:%M:%S').date()
+            
+    # Get the latest values from the database
+    def get_latest_values(self):
+        if DB_TYPE == "AWS":
+            response = self.table.scan(
+                FilterExpression=Attr("Time").gte("1970-01-01"),
+                ExpressionAttributeNames={
+                    "#ts": "Time"
+                },
+                ProjectionExpression="#ts, Temperature, Humidity, eCO2"
+            )
+            response = sorted(response['Items'], key=lambda x: x['Time'], reverse=True)
+            return pd.DataFrame(response)
+        else:
+            query = "SELECT * FROM weather_data ORDER BY Time DESC LIMIT 1"
+            return pd.read_sql_query(query, self.conn)
+            
+    def get_data_by_timerange(self, time_range):
+        if DB_TYPE == "AWS":
+            if time_range == 0: # Current day
+                start_date = datetime.now().strftime('%Y-%m-%d')
+            elif time_range == 1: # Current week
+                start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+            else: # All time
+                start_date = "1970-01-01"
+                
+            response = self.table.scan(
+                FilterExpression=Attr("Time").gte(start_date),
+                ExpressionAttributeNames={
+                    "#ts": "Time"
+                },
+                ProjectionExpression="#ts, Temperature, Humidity, eCO2"
+            )
+            df = pd.DataFrame(response['Items'])
+            for col in ['Temperature', 'Humidity', 'eCO2']:
+                df[col] = df[col].astype(float)
+            df['Time'] = pd.to_datetime(df['Time'])
+            
+            if time_range == 1:
+                df = df[df["Time"].dt.date != df["Time"].dt.date.min()]
+                
+            return df
+        else:
+            if time_range == 0:
+                query = "SELECT * FROM weather_data WHERE DATE(Time) = DATE('now')"
+            elif time_range == 1:
+                query = "SELECT * FROM weather_data WHERE Time > DATE('now', '-7 days')"
+            else:
+                query = "SELECT * FROM weather_data"
+                
+            df = pd.read_sql_query(query, self.conn)
+            df['Time'] = pd.to_datetime(df['Time'])
+            
+            if time_range != 0:
+                df = df[df["Time"].dt.date != df["Time"].dt.date.min()]
+                
+            return df
+            
+    def close(self):
+        if DB_TYPE == "LOCAL":
+            self.conn.close()
+
 
 pio.templates.default = "plotly_dark"
 
@@ -92,7 +195,7 @@ app.layout = html.Div([
                 dbc.Switch(
                     id='outdoor-toggle',
                     label='Show Outdoor Weather',
-                    value=True,
+                    value=False,
                     inputClassName="mr-2"
                 ),
                 html.H5("Aggregation and Chart Type"),
@@ -135,9 +238,9 @@ app.clientside_callback(
 @cache.memoize(timeout=CACHE_TIMEOUT)
 def get_outdoor_weather():
     '''Retrieves outdoor weather data and saves it to a parquet file for caching. The data is downloaded at most once per day.'''
-    conn = sqlite3.connect(DB_PATH)
-    min_date = pd.read_sql_query("SELECT MIN(Time) FROM weather_data", conn).iloc[0, 0]
-    min_date = datetime.strptime(min_date, '%Y-%m-%d %H:%M:%S').date()
+    db = DatabaseHandler()
+    min_date = db.get_min_date()
+    db.close()
     GATHER_DATA = True
 
     try:
@@ -164,8 +267,8 @@ def get_outdoor_weather():
             "longitude": LONGITUDE,
             "hourly": ["temperature_2m", "relative_humidity_2m", "precipitation"],
             "timezone": "auto",
-            "start_date": min_date - timedelta(days=1),
-            "end_date": current_date - timedelta(days=1),
+            "start_date": min_date - timedelta(days=6),
+            "end_date": current_date - timedelta(days=6),
         }
 
         responses = openmeteo.weather_api(url, params=params)
@@ -178,8 +281,8 @@ def get_outdoor_weather():
             "longitude": LONGITUDE,
             "minutely_15": ["temperature_2m", "relative_humidity_2m", "precipitation"],
             "timezone": "auto",
-            "start_date": current_date,
-            "end_date": current_date,
+            "past_days": 5,
+            "forecast_days": 1
         }
 
         responses = openmeteo.weather_api(url, params=params)
@@ -199,10 +302,10 @@ def get_outdoor_weather():
                 'Humidity': data.Variables(1).ValuesAsNumpy(),
                 'Precipitation': data.Variables(2).ValuesAsNumpy()
             })
-            daily_data = pd.concat([daily_data, response_df])
+            daily_data = pd.concat([daily_data.dropna(), response_df.dropna()])
 
-        df_export = pd.concat([df_export, daily_data])
-        df_export = df_export.dropna().sort_values(by='Time')
+        df_export = pd.concat([df_export, daily_data]).drop_duplicates()
+        df_export = df_export.sort_values(by='Time')
         df_export['Time'] = pd.to_datetime(df_export['Time'], unit='s', format='%Y-%m-%d %H:%M:%S')
         df_export.to_parquet('weather_data_outdoor.parquet')
 
@@ -235,15 +338,14 @@ def update_granularity_slider(current_time_range, current_granularity):
 )
 @cache.memoize(timeout=CACHE_TIMEOUT)
 def update_widget_values(n_intervals):
-    conn = sqlite3.connect(DB_PATH)
-    last_row = pd.read_sql_query("SELECT * FROM weather_data ORDER BY Time DESC LIMIT 1", conn).iloc[0]
-    conn.close()
+    db = DatabaseHandler()
+    last_row = db.get_latest_values().iloc[0]
+    db.close()
     
     if last_row["eCO2"] > 1000:
         title = f"+++AIR+++ {last_row['eCO2']:.0f}ppb | {last_row['Temperature']:.2f}°C | {last_row['Humidity']:.2f}%"
     else:
         title = f"{last_row['eCO2']:.0f}ppb | {last_row['Temperature']:.2f}°C | {last_row['Humidity']:.2f}%"
-        
 
     return (f"Temperature: {last_row['Temperature']:.2f}°C",
             f"Humidity: {last_row['Humidity']:.2f}%",
@@ -262,34 +364,18 @@ def update_widget_values(n_intervals):
 @cache.memoize(timeout=CACHE_TIMEOUT)
 def update_daily_graph(granularity, time_range, aggregation_chart_selector, include_outdoor):
     aggregation_type, chart_type = aggregation_chart_selector.split('-')
-    conn = sqlite3.connect(DB_PATH)
-    
-    if time_range == 0:
-        df = pd.read_sql_query("SELECT * FROM weather_data WHERE DATE(Time) = DATE('now')", conn)
-        df['Time'] = pd.to_datetime(df['Time'])
-
-    elif time_range == 1:
-        df = pd.read_sql_query("SELECT * FROM weather_data WHERE Time > DATE('now', '-7 days')", conn)
-        # the first day of data is ignored so that the 24h chart range starts at midnight
-        df['Time'] = pd.to_datetime(df['Time'])
-        df = df[df["Time"].dt.date != df["Time"].dt.date.min()]
-
-    else:
-        df = pd.read_sql_query("SELECT * FROM weather_data", conn)
-        df['Time'] = pd.to_datetime(df['Time'])
-        df = df[df["Time"].dt.date != df["Time"].dt.date.min()]
-    
-    conn.close()
+    db = DatabaseHandler()
+    df = db.get_data_by_timerange(time_range)
+    db.close()
 
     if include_outdoor:
         df_outdoor = get_outdoor_weather()
-
         #interpolate outdoor data according to granularity
-        df_outdoor = df_outdoor.set_index('Time').resample(str(granularity) + "S").interpolate().reset_index()
+        df_outdoor = df_outdoor.set_index('Time').resample(str(granularity) + "s").interpolate().reset_index()
         df = df.sort_values("Time")
         df = pd.merge_asof(df, df_outdoor, on="Time", suffixes=("", "_outdoor"), direction="nearest")
 
-    df = df.set_index('Time').resample(str(granularity) + "S").median().reset_index()
+    df = df.set_index('Time').resample(str(granularity) + "s").median().reset_index()
     df["clock_time"] = df["Time"].dt.time
 
     unique_days = df["Time"].dt.date.unique()
@@ -402,4 +488,4 @@ def update_daily_graph(granularity, time_range, aggregation_chart_selector, incl
     return fig_merged
 
 if __name__ == '__main__':
-    app.run_server(debug=True)
+    app.run_server(host="0.0.0.0", port=8050, debug=True)
