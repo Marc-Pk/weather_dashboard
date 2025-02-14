@@ -20,11 +20,11 @@ with warnings.catch_warnings(action='ignore'):
     from boto3.dynamodb.conditions import Attr
 
 ########## Config values ##########
-# Either "AWS" if you are using AWS DynamoDB or "LOCAL" for a SQLite database.
+# Either "AWS" if you are using AWS DynamoDB or "LOCAL" for a SQLite database
 DB_TYPE = os.getenv("DB_TYPE", "AWS")
 
 # If your DB_TYPE is "AWS", enter the name of your table here
-# If your DB_TYPE is "LOCAL", enter the path to your SQLite database here and make sure to include "weather_data.db" at the end.
+# If your DB_TYPE is "LOCAL", enter the path to your SQLite database here and make sure to include "weather_data.db" at the end
 DB_PATH = os.getenv("DB_PATH", r"weather-data")
 
 # Coordinates for API weather data

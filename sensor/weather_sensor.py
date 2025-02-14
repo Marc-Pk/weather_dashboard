@@ -10,7 +10,7 @@ from datetime import datetime
 # Set the database type to either "LOCAL" or "AWS"
 DB_TYPE = "AWS"
 
-# Name of your DynamoDB database.
+# Name of your DynamoDB database
 DB_PATH = 'weather-data'
 
 # Initialize the database/API connection

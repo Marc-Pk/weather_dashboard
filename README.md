@@ -2,6 +2,13 @@
 
 A simple weather monitoring system using the ENS160+AHT21 sensor. Measured data is saved either to a DynamoDB on AWS or a SQLite database. The data can then be plotted in an interactive dashboard, including weather report data using the open-meteo API if desired.
 
+# Table of Contents
+1. [Features](#features)
+2. [Setup](#setup)
+    1. [On your Raspberry Pi](#on-your-raspberry-pi)
+    2. [Setting up the dashboard manually](#setting-up-the-dashboard-manually)
+    3. [Setting up the dashboard as a docker container](#setting-up-the-dashboard-as-a-docker-container)
+
 ## Features
 - Real-time display of measured temperature, humidity, and eCO2 levels
 - save data locally or on AWS
@@ -37,7 +44,8 @@ First of all, clone this repository.
    @reboot cd /<path>/weather && sudo python weather_sensor.py &
    ```
 
-### Setting up the dashboard
+### Setting up the dashboard manually
+
 1. In the dashboard folder, install the required Python packages with 
 
    ```
@@ -50,5 +58,16 @@ First of all, clone this repository.
    ```
    python weather_dashboard.py
    ```
-   Alternatively, build your own docker container with the provided dockerfile. The dashboard will be accessible at `http://localhost:8050`.
+   The dashboard will be accessible at `localhost:8050`.
  
+### Setting up the dashboard as a docker container
+
+Pull the docker image with:
+
+```
+docker run -p 8050:8050 -e AWS_ACCESS_KEY_ID=<your-aws-key> -e AWS_SECRET_ACCESS_KEY=<your-aws-secret-key>
+ marcpuikys/weather-dashboard:latest
+```
+
+Alternatively, build your own docker container with the provided dockerfile. Adapt the command to modify the environment variables from ```weather_dashboard.py``` as desired. If you want to use a local database, make sure the path is available to the virtual environment. The dashboard will be accessible at `localhost:8050`.
+
