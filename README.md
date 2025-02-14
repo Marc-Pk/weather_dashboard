@@ -62,12 +62,22 @@ First of all, clone this repository.
  
 ### Setting up the dashboard as a docker container
 
-Pull the docker image with:
+1. Pull the docker image with:
 
-```
-docker run -p 8050:8050 -e AWS_ACCESS_KEY_ID=<your-aws-key> -e AWS_SECRET_ACCESS_KEY=<your-aws-secret-key>
- marcpuikys/weather-dashboard:latest
-```
+   ```
+   docker run -p 8050:8050 -e AWS_ACCESS_KEY_ID=<your-aws-key> -e AWS_SECRET_ACCESS_KEY=<your-aws-secret-key>
+   marcpuikys/weather-dashboard:latest
+   ```
 
-Alternatively, build your own docker container with the provided dockerfile. Adapt the command to modify the environment variables from ```weather_dashboard.py``` as desired. If you want to use a local database, make sure the path is available to the virtual environment. The dashboard will be accessible at `localhost:8050`.
+   Alternatively, build your own docker container with the provided dockerfile. Adapt the command to modify the environment variables from ```weather_dashboard.py``` as desired. If you want to use a local database, make sure the path is available to the virtual environment. The dashboard will be accessible at `localhost:8050`.
 
+2. If desired, deploy the container with Kubernetes using the provided ```deployment.yaml``` and ```service.yaml``` files. Adapt the environment variables as needed and make sure that a secret with your AWS credentials is available. For example, using minikube:
+
+   ```
+   kubectl apply -f deployment.yaml
+   kubectl apply -f service.yaml
+
+   minikube service weather-dashboard-service
+   ```
+
+   The dashboard will then be accessible at the provided IP address.

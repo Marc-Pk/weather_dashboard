@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weather-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weather-dashboard
+  template:
+    metadata:
+      labels:
+        app: weather-dashboard
+    spec:
+      containers:
+      - name: weather-dashboard
+        image: weather-dashboard
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8050
+        env:
+        - name: DB_TYPE
+          value: "AWS"
+        - name: DB_PATH
+          value: "weather-data"
+        - name: CACHE_TIMEOUT
+          value: "300"
+        - name: LATITUDE
+          value: "49.0094"
+        - name: LONGITUDE
+          value: "8.4044"
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: AWS_SECRET_ACCESS_KEY
+          
+
