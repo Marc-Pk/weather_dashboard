@@ -31,7 +31,7 @@ First of all, clone this repository.
    pip install -r requirements_sensor.txt
    ```
 
-3. Set the ```DB_TYPE``` variable in the ```weather_sensor.py``` file to "LOCAL" if you want to use a local database, which will be generated in the working directory that is used to call the script. Leave it at ```AWS``` to use a DynamoDB database that needs to have a partition key called "Time". Make sure that your AWS credentials are available on your RPI.
+3. Set the ```DB_TYPE``` variable in the ```weather_sensor.py``` file to "LOCAL" if you want to use a local database, which will be generated in the working directory that is used to call the script. Leave it at ```AWS``` to use a DynamoDB database that needs to have a partition key called "date" and a sort key called "datetime". Make sure that your AWS credentials are available on your RPI.
 
 4. Start the sensor script:
    ```

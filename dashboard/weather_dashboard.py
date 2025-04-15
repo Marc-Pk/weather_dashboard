@@ -17,15 +17,15 @@ with warnings.catch_warnings(action='ignore'):
     from flask_caching import Cache
     from retry_requests import retry
     from datetime import datetime, timedelta
-    from boto3.dynamodb.conditions import Attr
+    from boto3.dynamodb.conditions import Key
 
 ########## Config values ##########
 # Either "AWS" if you are using AWS DynamoDB or "LOCAL" for a SQLite database
 DB_TYPE = os.getenv("DB_TYPE", "AWS")
 
 # If your DB_TYPE is "AWS", enter the name of your table here
-# If your DB_TYPE is "LOCAL", enter the path to your SQLite database here and make sure to include "weather_data.db" at the end
-DB_PATH = os.getenv("DB_PATH", r"weather-data")
+# If your DB_TYPE is "LOCAL", enter the path to your SQLite database here and make sure to include "sensor_data.db" at the end
+DB_PATH = os.getenv("DB_PATH", r"sensor-data")
 
 # Coordinates for API weather data
 LATITUDE = float(os.getenv("LATITUDE", 49.0094))
@@ -39,83 +39,194 @@ class DatabaseHandler:
         if DB_TYPE == "AWS":
             self.dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
             self.table = self.dynamodb.Table(DB_PATH)
+            # Define the core fetching function for AWS, memoized by date
+            # This function should ONLY be called for specific dates.
+            # We add a dummy parameter `_` to allow easy cache busting for today
+            @cache.memoize()
+            def fetch_day_data_aws_cached(query_date_str, _=None):
+                print(f"DB HIT (AWS): Fetching data for date {query_date_str}")
+                try:
+                    response = self.table.query(
+                        KeyConditionExpression=Key('date').eq(query_date_str),
+                        ExpressionAttributeNames={"#dt": "datetime"},
+                        ProjectionExpression="#dt, Temperature, Humidity, eCO2"
+                    )
+                    items = response.get('Items', [])
+                    if not items:
+                         return pd.DataFrame(columns=['datetime', 'Temperature', 'Humidity', 'eCO2'])
+
+                    df = pd.DataFrame(items)
+                    # Convert numeric types here if necessary, before caching
+                    for col in ['Temperature', 'Humidity', 'eCO2']:
+                         df[col] = pd.to_numeric(df[col])
+                    return df
+
+                except Exception as e:
+                    print(f"Error fetching data for {query_date_str} from AWS: {e}")
+                    # Return empty DataFrame on error to avoid caching failures
+                    return pd.DataFrame(columns=['datetime', 'Temperature', 'Humidity', 'eCO2'])
+
+            self._fetch_day_data_aws_cached = fetch_day_data_aws_cached
+
+        elif DB_TYPE == "LOCAL":
+            self.conn = sqlite3.connect(DB_PATH, check_same_thread=False) 
+
+            @cache.memoize()
+            def fetch_day_data_local_cached(query_date_str, _=None):
+                 print(f"DB HIT (Local): Fetching data for date {query_date_str}")
+                 try:
+                    query = f"SELECT Time as datetime, Temperature, Humidity, eCO2 FROM weather_data WHERE DATE(Time) = '{query_date_str}'"
+                    df = pd.read_sql_query(query, self.conn)
+                    if df.empty:
+                         return pd.DataFrame(columns=['datetime', 'Temperature', 'Humidity', 'eCO2'])
+                    
+                    for col in ['Temperature', 'Humidity', 'eCO2']:
+                         df[col] = pd.to_numeric(df[col], errors='coerce')
+                    return df
+                 except Exception as e:
+                    print(f"Error fetching data for {query_date_str} from Local DB: {e}")
+                    return pd.DataFrame(columns=['datetime', 'Temperature', 'Humidity', 'eCO2'])
+
+            self._fetch_day_data_local_cached = fetch_day_data_local_cached
         else:
-            self.conn = sqlite3.connect(DB_PATH)
-            
-    # Get the minimum date in the database
-    def get_min_date(self):
+            raise ValueError("Unsupported DB_TYPE")
+
+    def _get_fetch_function(self):
+        """Returns the appropriate cached data fetching function based on DB_TYPE."""
         if DB_TYPE == "AWS":
-            response = self.table.scan(
-                FilterExpression=Attr("Time").gte("1970-01-01"),
-                ExpressionAttributeNames={
-                    "#ts": "Time"
-                },
-                ProjectionExpression="#ts"
-            )
-            min_date = min(item['Time'] for item in response['Items'])
-            return datetime.strptime(min_date, '%Y-%m-%d %H:%M:%S').date()
+            return self._fetch_day_data_aws_cached
         else:
-            query = "SELECT MIN(Time) FROM weather_data"
-            min_date = pd.read_sql_query(query, self.conn).iloc[0, 0]
-            return datetime.strptime(min_date, '%Y-%m-%d %H:%M:%S').date()
-            
-    # Get the latest values from the database
-    def get_latest_values(self):
-        if DB_TYPE == "AWS":
-            response = self.table.scan(
-                FilterExpression=Attr("Time").gte("1970-01-01"),
-                ExpressionAttributeNames={
-                    "#ts": "Time"
-                },
-                ProjectionExpression="#ts, Temperature, Humidity, eCO2"
-            )
-            response = sorted(response['Items'], key=lambda x: x['Time'], reverse=True)
-            return pd.DataFrame(response)
+            return self._fetch_day_data_local_cached
+
+    def _fetch_data_for_day(self, query_date_str):
+        """Fetch data for a single day. Handles cache clearing for the current day."""
+        fetch_func = self._get_fetch_function()
+
+        if query_date_str == datetime.now().strftime('%Y-%m-%d'):
+            # Invalidate cache for today before fetching
+            cache.delete_memoized(fetch_func, query_date_str)
+            # Call with a changing dummy arg to ensure it's not memoized during this request if called multiple times today
+            return fetch_func(query_date_str, _=datetime.now().timestamp())
         else:
-            query = "SELECT * FROM weather_data ORDER BY Time DESC LIMIT 1"
-            return pd.read_sql_query(query, self.conn)
-            
+            # For past dates, rely on the memoized function
+            return fetch_func(query_date_str)
+
+    def get_data(self, start_date_str, end_date_str):
+        """Fetches data for a range of dates (inclusive). Leverages caching for individual past days."""
+        all_data = []
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+
+        current_date = start_date
+        while current_date <= end_date:
+            current_date_str = current_date.strftime('%Y-%m-%d')
+            day_df = self._fetch_data_for_day(current_date_str)
+            if not day_df.empty:
+                all_data.append(day_df)
+            current_date += timedelta(days=1)
+
+        if not all_data:
+            return pd.DataFrame()
+
+        df = pd.concat(all_data, ignore_index=True)
+        return df
+
+    def get_all_historical_data(self):
+        """Recursively fetches data day by day into the past until no more data is found. Leverages the daily cache."""
+        all_data = []
+        # Start from yesterday
+        current_query_date = datetime.now().date() - timedelta(days=1)
+
+        while True:
+            query_date_str = current_query_date.strftime('%Y-%m-%d')
+            print(f"Attempting to fetch historical data for: {query_date_str}")
+            day_df = self._fetch_data_for_day(query_date_str) # This uses the cache
+
+            if day_df.empty:
+                print(f"No more historical data found before {query_date_str}.")
+                break # Stop when no data is returned for a day
+
+            all_data.append(day_df)
+
+            # Move to the previous day
+            current_query_date -= timedelta(days=1)
+
+        if not all_data:
+            return pd.DataFrame()
+
+        df = pd.concat(all_data, ignore_index=True)
+        return df
+
     def get_data_by_timerange(self, time_range):
-        if DB_TYPE == "AWS":
-            if time_range == 0: # Current day
-                start_date = datetime.now().strftime('%Y-%m-%d')
-            elif time_range == 1: # Current week
-                start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-            else: # All time
-                start_date = "1970-01-01"
-                
-            response = self.table.scan(
-                FilterExpression=Attr("Time").gte(start_date),
-                ExpressionAttributeNames={
-                    "#ts": "Time"
-                },
-                ProjectionExpression="#ts, Temperature, Humidity, eCO2"
-            )
-            df = pd.DataFrame(response['Items'])
+        """Get data based on predefined ranges."""
+        final_df = pd.DataFrame()
+        now = datetime.now()
+        today_str = now.strftime('%Y-%m-%d')
+
+        if time_range == 0: # Current day
+            print("Fetching data for: Today")
+            final_df = self._fetch_data_for_day(today_str) # Fetches fresh data
+
+        elif time_range == 1: # Current week
+            print("Fetching data for: Current Week (inc. today)")
+            start_date = now.date() - timedelta(days=7)
+            start_date_str = start_date.strftime('%Y-%m-%d')
+            final_df = self.get_data(start_date_str, today_str) # Fetches range, today will be fresh
+
+        elif time_range > 1: # All time
+            print("Fetching data for: All Time")
+            # Get all historical data (uses cache, stops when no more data)
+            historical_df = self.get_all_historical_data()
+            # Get fresh data for today
+            today_df = self._fetch_data_for_day(today_str)
+            # Combine historical and today's data
+            final_df = pd.concat([historical_df, today_df], ignore_index=True)
+
+        # Final Processing (applied to all valid time_ranges)
+        if not final_df.empty:
+
+            final_df['Time'] = pd.to_datetime(final_df['datetime'])
+            final_df.drop(columns=['datetime'], inplace=True, errors='ignore')
+
+            # Convert numeric columns
             for col in ['Temperature', 'Humidity', 'eCO2']:
-                df[col] = df[col].astype(float)
-            df['Time'] = pd.to_datetime(df['Time'])
-            
-            if time_range == 1:
-                df = df[df["Time"].dt.date != df["Time"].dt.date.min()]
-                
-            return df
-        else:
-            if time_range == 0:
-                query = "SELECT * FROM weather_data WHERE DATE(Time) = DATE('now')"
-            elif time_range == 1:
-                query = "SELECT * FROM weather_data WHERE Time > DATE('now', '-7 days')"
-            else:
-                query = "SELECT * FROM weather_data"
-                
-            df = pd.read_sql_query(query, self.conn)
-            df['Time'] = pd.to_datetime(df['Time'])
-            
-            if time_range != 0:
-                df = df[df["Time"].dt.date != df["Time"].dt.date.min()]
-                
-            return df
-            
+                if col in final_df.columns:
+                     final_df[col] = pd.to_numeric(final_df[col])
+
+            final_df.sort_values(by="Time", ascending=True, inplace=True)
+
+            if time_range >= 1 and not final_df.empty:
+                min_date_in_df = final_df["Time"].dt.date.min()
+                final_df = final_df[final_df["Time"].dt.date != min_date_in_df]
+
+        return final_df
+
+    # Get the latest single reading
+    def get_latest_values(self):
+        """Gets the most recent data point for the current day."""
+        if DB_TYPE == "LOCAL":
+             # Optimized query for SQLite
+             query = "SELECT * FROM weather_data ORDER BY Time DESC LIMIT 1"
+             try:
+                 df = pd.read_sql_query(query, self.conn)
+                 if not df.empty:
+                      df['Time'] = pd.to_datetime(df['Time'])
+                      return df.iloc[0]
+                 return None
+             except Exception as e:
+                 print(f"Error fetching latest value from Local DB: {e}")
+                 return None
+
+        today_df = self._fetch_data_for_day(datetime.now().strftime('%Y-%m-%d')) # Gets fresh data
+        if not today_df.empty:
+            today_df['Time'] = pd.to_datetime(today_df['datetime'])
+            today_df.sort_values(by='Time', ascending=False, inplace=True)
+            for col in ['Temperature', 'Humidity', 'eCO2']:
+                if col in today_df.columns:
+                     today_df[col] = pd.to_numeric(today_df[col], errors='coerce')
+            return today_df.iloc[0]
+        return None
+
     def close(self):
         if DB_TYPE == "LOCAL":
             self.conn.close()
@@ -233,13 +344,12 @@ app.clientside_callback(
     [Input("browser-title-values", "children")]
 )
 
-
 # API calls for outdoor weather data
 @cache.memoize(timeout=CACHE_TIMEOUT)
-def get_outdoor_weather():
+def get_outdoor_weather(time_range):
     '''Retrieves outdoor weather data and saves it to a parquet file for caching. The data is downloaded at most once per day.'''
     db = DatabaseHandler()
-    min_date = db.get_min_date()
+    min_date = db.get_data_by_timerange(time_range)["Time"].min().date()
     db.close()
     GATHER_DATA = True
 
@@ -339,7 +449,7 @@ def update_granularity_slider(current_time_range, current_granularity):
 @cache.memoize(timeout=CACHE_TIMEOUT)
 def update_widget_values(n_intervals):
     db = DatabaseHandler()
-    last_row = db.get_latest_values().iloc[0]
+    last_row = db.get_latest_values()
     db.close()
     
     if last_row["eCO2"] > 1000:
@@ -369,7 +479,7 @@ def update_daily_graph(granularity, time_range, aggregation_chart_selector, incl
     db.close()
 
     if include_outdoor:
-        df_outdoor = get_outdoor_weather()
+        df_outdoor = get_outdoor_weather(time_range)
         #interpolate outdoor data according to granularity
         df_outdoor = df_outdoor.set_index('Time').resample(str(granularity) + "s").interpolate().reset_index()
         df = df.sort_values("Time")

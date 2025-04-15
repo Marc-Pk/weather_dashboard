@@ -11,17 +11,17 @@ from datetime import datetime
 DB_TYPE = "AWS"
 
 # Name of your DynamoDB database
-DB_PATH = 'weather-data'
+DB_PATH = 'sensor-data'
 
 # Initialize the database/API connection
 if DB_TYPE == "LOCAL":
     import sqlite3
-    conn = sqlite3.connect('weather_data.db')
+    conn = sqlite3.connect('sensor_data.db')
     cursor = conn.cursor()
 
     # Create table if it doesn't exist
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS weather_data
+        CREATE TABLE IF NOT EXISTS sensor_data
         (Time TIMESTAMP, Humidity REAL, Temperature REAL, TVOC INTEGER, eCO2 INTEGER)
         ''')
     conn.commit()
@@ -57,24 +57,26 @@ while True:
    
     # Calculate median values once per minute and send them to the database
     if current_time.minute != data[0][0].minute:
-        median_data = (data[0][0].replace(second=0, microsecond=0), median([x[1] for x in data]), median([x[2] for x in data]), median([x[3] for x in data]), median([x[4] for x in data]))
-        median_data = (median_data[0].strftime('%Y-%m-%d %H:%M:%S'), round(median_data[1], 2), round(median_data[2], 2), round(median_data[3]), round(median_data[4]))
-       
+        # Calculate median values
+        median_data_raw = (data[0][0].replace(second=0, microsecond=0), median([x[1] for x in data]), median([x[2] for x in data]), median([x[3] for x in data]), median([x[4] for x in data]))
+        median_data = (median_data_raw[0].strftime('%Y-%m-%d'), median_data_raw[0].strftime('%Y-%m-%d %H:%M:%S'), round(median_data_raw[1], 2), round(median_data_raw[2], 2), round(median_data_raw[3]), round(median_data_raw[4]))
+
         # Insert data into the DynamoDB database
         if DB_TYPE == "AWS":
             response = table.put_item(
                 Item={
-                    'Time': str(median_data[0]),
-                    'Humidity': Decimal(str(median_data[1])),
-                    'Temperature': Decimal(str(median_data[2])),
-                    'TVOC': Decimal(str(median_data[3])),
-                    'eCO2': Decimal(str(median_data[4]))
+                    'date': str(median_data[0]),
+                    'datetime': str(median_data[1]),
+                    'Humidity': Decimal(str(median_data[2])),
+                    'Temperature': Decimal(str(median_data[3])),
+                    'TVOC': Decimal(str(median_data[4])),
+                    'eCO2': Decimal(str(median_data[5]))
                 }
-            )
+            )       
 
         # Alternatively, insert data into the SQLite database
         else:
-            cursor.execute('''INSERT INTO weather_data (Time, Humidity, Temperature, TVOC, eCO2) VALUES (?, ?, ?, ?, ?)''', median_data)
+            cursor.execute('''INSERT INTO sensor_data (date, datetime, Humidity, Temperature, TVOC, eCO2) VALUES (?, ?, ?, ?, ?, ?)''', median_data)
             conn.commit()
        
         # Clear data
