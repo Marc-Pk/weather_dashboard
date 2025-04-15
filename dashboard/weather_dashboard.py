@@ -598,4 +598,4 @@ def update_daily_graph(granularity, time_range, aggregation_chart_selector, incl
     return fig_merged
 
 if __name__ == '__main__':
-    app.run_server(host="0.0.0.0", port=8050, debug=True)
+    app.run(host="0.0.0.0", port=8050, debug=True)
