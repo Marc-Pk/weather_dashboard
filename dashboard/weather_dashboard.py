@@ -11,8 +11,11 @@ with warnings.catch_warnings(action='ignore'):
     import pytz
     import boto3
     import os
-    from dash import dcc, html
-    from dash.dependencies import Output, Input
+    import threading
+    import time
+    import queue
+    from dash import dcc, html, clientside_callback
+    from dash.dependencies import Output, Input, State
     from plotly.subplots import make_subplots
     from flask_caching import Cache
     from retry_requests import retry
@@ -26,25 +29,28 @@ DB_TYPE = os.getenv("DB_TYPE", "AWS")
 # If your DB_TYPE is "AWS", enter the name of your table here
 # If your DB_TYPE is "LOCAL", enter the path to your SQLite database here and make sure to include "sensor_data.db" at the end
 DB_PATH = os.getenv("DB_PATH", r"sensor-data")
+REGION_NAME = os.getenv("AWS_REGION", "us-east-1")
 
 # Coordinates for API weather data
 LATITUDE = float(os.getenv("LATITUDE", 49.0094))
 LONGITUDE = float(os.getenv("LONGITUDE", 8.4044))
 
-# Timeout for caching of database fetches in seconds
-CACHE_TIMEOUT = int(os.getenv("CACHE_TIMEOUT", 300))
+# Create a global queue for new data from the stream
+new_data_queue = queue.Queue()
+
+notification_cooldown = timedelta(minutes=15)
 
 class DatabaseHandler:
     def __init__(self):
+        self.today_df = pd.DataFrame(columns=['Time', 'Temperature', 'Humidity', 'eCO2'])
+        self.today_date_str = datetime.now().strftime('%Y-%m-%d')
+
         if DB_TYPE == "AWS":
-            self.dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+            self.dynamodb = boto3.resource('dynamodb', region_name=REGION_NAME)
             self.table = self.dynamodb.Table(DB_PATH)
-            # Define the core fetching function for AWS, memoized by date
-            # This function should ONLY be called for specific dates.
-            # We add a dummy parameter `_` to allow easy cache busting for today
+
             @cache.memoize()
             def fetch_day_data_aws_cached(query_date_str, _=None):
-                print(f"DB HIT (AWS): Fetching data for date {query_date_str}")
                 try:
                     response = self.table.query(
                         KeyConditionExpression=Key('date').eq(query_date_str),
@@ -52,65 +58,130 @@ class DatabaseHandler:
                         ProjectionExpression="#dt, Temperature, Humidity, eCO2"
                     )
                     items = response.get('Items', [])
-                    if not items:
-                         return pd.DataFrame(columns=['datetime', 'Temperature', 'Humidity', 'eCO2'])
+                    df = normalize_aws_df(pd.DataFrame(items))
 
-                    df = pd.DataFrame(items)
-                    # Convert numeric types here if necessary, before caching
-                    for col in ['Temperature', 'Humidity', 'eCO2']:
-                         df[col] = pd.to_numeric(df[col])
+                    if query_date_str == self.today_date_str:
+                        self.today_df = df.copy()
+
                     return df
-
                 except Exception as e:
                     print(f"Error fetching data for {query_date_str} from AWS: {e}")
-                    # Return empty DataFrame on error to avoid caching failures
-                    return pd.DataFrame(columns=['datetime', 'Temperature', 'Humidity', 'eCO2'])
+                    return pd.DataFrame(columns=['Time', 'Temperature', 'Humidity', 'eCO2'])
 
             self._fetch_day_data_aws_cached = fetch_day_data_aws_cached
 
         elif DB_TYPE == "LOCAL":
-            self.conn = sqlite3.connect(DB_PATH, check_same_thread=False) 
-
-            @cache.memoize()
-            def fetch_day_data_local_cached(query_date_str, _=None):
-                 print(f"DB HIT (Local): Fetching data for date {query_date_str}")
-                 try:
+             self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+             @cache.memoize()
+             def fetch_day_data_local_cached(query_date_str, _=None):
+                print(f"DB HIT (Local): Fetching data for date {query_date_str}")
+                try:
                     query = f"SELECT Time as datetime, Temperature, Humidity, eCO2 FROM weather_data WHERE DATE(Time) = '{query_date_str}'"
                     df = pd.read_sql_query(query, self.conn)
                     if df.empty:
-                         return pd.DataFrame(columns=['datetime', 'Temperature', 'Humidity', 'eCO2'])
+                        return pd.DataFrame(columns=['Time', 'Temperature', 'Humidity', 'eCO2'])
                     
                     for col in ['Temperature', 'Humidity', 'eCO2']:
-                         df[col] = pd.to_numeric(df[col], errors='coerce')
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                            
+                    if query_date_str == self.today_date_str:
+                        self.today_df = df.copy()
                     return df
-                 except Exception as e:
+                except Exception as e:
                     print(f"Error fetching data for {query_date_str} from Local DB: {e}")
-                    return pd.DataFrame(columns=['datetime', 'Temperature', 'Humidity', 'eCO2'])
+                    return pd.DataFrame(columns=['Time', 'Temperature', 'Humidity', 'eCO2'])
 
-            self._fetch_day_data_local_cached = fetch_day_data_local_cached
+             self._fetch_day_data_local_cached = fetch_day_data_local_cached
         else:
             raise ValueError("Unsupported DB_TYPE")
 
+        # Initialize data on startup
+        self._fetch_data_for_day(self.today_date_str)
+
     def _get_fetch_function(self):
-        """Returns the appropriate cached data fetching function based on DB_TYPE."""
+        """Returns the relevant cached data fetching function based on DB_TYPE."""
         if DB_TYPE == "AWS":
             return self._fetch_day_data_aws_cached
         else:
             return self._fetch_day_data_local_cached
 
+    def _check_date_rollover(self):
+        """Checks if the date has changed and resets today_df if needed."""
+        current_date_str = datetime.now().strftime('%Y-%m-%d')
+        if current_date_str != self.today_date_str:
+            print(f"Date rolled over from {self.today_date_str} to {current_date_str}")
+            self.today_date_str = current_date_str
+            self.today_df = pd.DataFrame(columns=['Time', 'Temperature', 'Humidity', 'eCO2'])
+            self._fetch_data_for_day(self.today_date_str)
+
     def _fetch_data_for_day(self, query_date_str):
         """Fetch data for a single day. Handles cache clearing for the current day."""
         fetch_func = self._get_fetch_function()
+        self._check_date_rollover()
 
-        if query_date_str == datetime.now().strftime('%Y-%m-%d'):
-            # Invalidate cache for today before fetching
-            cache.delete_memoized(fetch_func, query_date_str)
-            # Call with a changing dummy arg to ensure it's not memoized during this request if called multiple times today
-            return fetch_func(query_date_str, _=datetime.now().timestamp())
+        if query_date_str == self.today_date_str:
+            use_cached_today = False
+            if not self.today_df.empty and 'Time' in self.today_df.columns:
+                try:
+                    latest_time = pd.to_datetime(self.today_df['Time']).max()
+                    time_diff = datetime.now() - latest_time
+                    if time_diff.total_seconds() / 60 < 3:
+                        # print("Using in-memory today_df - last update less than 3 minutes ago")
+                        use_cached_today = True
+                except Exception as e:
+                    print(f"Error comparing times for today's cache: {e}")
+
+            if use_cached_today:
+                return self.today_df.copy()
+            
+            else:
+                print("NOT USING CACHE, fetching fresh data for today: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                # Invalidate cache before fetching
+                cache.delete_memoized(fetch_func, query_date_str)
+                return fetch_func(query_date_str, _=datetime.now().timestamp())
+
         else:
             # For past dates, rely on the memoized function
             return fetch_func(query_date_str)
 
+    def update_today_df_from_stream(self, new_record_dict):
+        """Appends a new record from the stream to the internal today_df."""
+        self._check_date_rollover()
+
+        if new_record_dict.get('date') == self.today_date_str:
+            new_row_df = normalize_aws_df(pd.DataFrame([new_record_dict]))
+        if not new_row_df.empty:
+            self.today_df = pd.concat([self.today_df, new_row_df], ignore_index=True)
+            self.today_df.sort_values(by="Time", inplace=True)
+            self.today_df.drop_duplicates(subset=['Time'], keep='last', inplace=True)
+
+    def get_latest_values(self):
+        """Gets the most recent data point for the current day from internal df or DB."""
+        self._check_date_rollover()
+
+        if DB_TYPE == "LOCAL":
+             query = "SELECT * FROM weather_data ORDER BY Time DESC LIMIT 1"
+             try:
+                 df = pd.read_sql_query(query, self.conn)
+                 if not df.empty:
+                      df['Time'] = pd.to_datetime(df['Time'])
+                      return df.iloc[0]
+                 return None
+             except Exception as e:
+                 print(f"Error fetching latest value from Local DB: {e}")
+                 return None
+
+        # For AWS, rely on the internal today_df first
+        if not self.today_df.empty:
+            return self.today_df.iloc[-1].copy()
+        
+        # If today_df is empty, fetch from DB
+        else:
+            latest_from_db = self._fetch_data_for_day(self.today_date_str)
+            if not latest_from_db.empty:
+                return latest_from_db.iloc[-1].copy()
+            return None
+        
     def get_data(self, start_date_str, end_date_str):
         """Fetches data for a range of dates (inclusive). Leverages caching for individual past days."""
         all_data = []
@@ -140,11 +211,11 @@ class DatabaseHandler:
         while True:
             query_date_str = current_query_date.strftime('%Y-%m-%d')
             print(f"Attempting to fetch historical data for: {query_date_str}")
-            day_df = self._fetch_data_for_day(query_date_str) # This uses the cache
+            day_df = self._fetch_data_for_day(query_date_str) # Use the cache
 
             if day_df.empty:
                 print(f"No more historical data found before {query_date_str}.")
-                break # Stop when no data is returned for a day
+                break
 
             all_data.append(day_df)
 
@@ -164,36 +235,20 @@ class DatabaseHandler:
         today_str = now.strftime('%Y-%m-%d')
 
         if time_range == 0: # Current day
-            print("Fetching data for: Today")
-            final_df = self._fetch_data_for_day(today_str) # Fetches fresh data
+            final_df = self._fetch_data_for_day(today_str)
 
         elif time_range == 1: # Current week
-            print("Fetching data for: Current Week (inc. today)")
             start_date = now.date() - timedelta(days=7)
             start_date_str = start_date.strftime('%Y-%m-%d')
-            final_df = self.get_data(start_date_str, today_str) # Fetches range, today will be fresh
+            final_df = self.get_data(start_date_str, today_str)
 
         elif time_range > 1: # All time
-            print("Fetching data for: All Time")
-            # Get all historical data (uses cache, stops when no more data)
             historical_df = self.get_all_historical_data()
-            # Get fresh data for today
-            today_df = self._fetch_data_for_day(today_str)
-            # Combine historical and today's data
-            final_df = pd.concat([historical_df, today_df], ignore_index=True)
+            self.today_df = self._fetch_data_for_day(today_str)
+            final_df = pd.concat([historical_df, self.today_df], ignore_index=True)
 
-        # Final Processing (applied to all valid time_ranges)
         if not final_df.empty:
-
-            final_df['Time'] = pd.to_datetime(final_df['datetime'])
-            final_df.drop(columns=['datetime'], inplace=True, errors='ignore')
-
-            # Convert numeric columns
-            for col in ['Temperature', 'Humidity', 'eCO2']:
-                if col in final_df.columns:
-                     final_df[col] = pd.to_numeric(final_df[col])
-
-            final_df.sort_values(by="Time", ascending=True, inplace=True)
+            final_df = normalize_aws_df(final_df)
 
             if time_range >= 1 and not final_df.empty:
                 min_date_in_df = final_df["Time"].dt.date.min()
@@ -201,35 +256,89 @@ class DatabaseHandler:
 
         return final_df
 
-    # Get the latest single reading
-    def get_latest_values(self):
-        """Gets the most recent data point for the current day."""
-        if DB_TYPE == "LOCAL":
-             # Optimized query for SQLite
-             query = "SELECT * FROM weather_data ORDER BY Time DESC LIMIT 1"
-             try:
-                 df = pd.read_sql_query(query, self.conn)
-                 if not df.empty:
-                      df['Time'] = pd.to_datetime(df['Time'])
-                      return df.iloc[0]
-                 return None
-             except Exception as e:
-                 print(f"Error fetching latest value from Local DB: {e}")
-                 return None
-
-        today_df = self._fetch_data_for_day(datetime.now().strftime('%Y-%m-%d')) # Gets fresh data
-        if not today_df.empty:
-            today_df['Time'] = pd.to_datetime(today_df['datetime'])
-            today_df.sort_values(by='Time', ascending=False, inplace=True)
-            for col in ['Temperature', 'Humidity', 'eCO2']:
-                if col in today_df.columns:
-                     today_df[col] = pd.to_numeric(today_df[col], errors='coerce')
-            return today_df.iloc[0]
-        return None
-
     def close(self):
         if DB_TYPE == "LOCAL":
             self.conn.close()
+
+
+def normalize_aws_df(aws_df):
+    try:
+        aws_df['Time'] = pd.to_datetime(aws_df['datetime'])
+    except KeyError:
+        aws_df['Time'] = pd.to_datetime(aws_df['Time'])
+
+    aws_df.drop(columns=['datetime', 'date', 'TVOC'], inplace=True, errors='ignore')
+
+    for col in ['Temperature', 'Humidity', 'eCO2']:
+        if col in aws_df.columns:
+            aws_df[col] = pd.to_numeric(aws_df[col])
+
+    aws_df.sort_values(by="Time", inplace=True)
+    return aws_df
+
+
+
+def get_latest_iterator():
+    dynamodb = boto3.client("dynamodb", region_name=REGION_NAME)
+    streams = boto3.client("dynamodbstreams", region_name=REGION_NAME)
+    stream_arn = dynamodb.describe_table(TableName=DB_PATH)["Table"]["LatestStreamArn"]
+    stream_desc = streams.describe_stream(StreamArn=stream_arn)
+    shards = stream_desc["StreamDescription"]["Shards"]
+
+    if not shards:
+        print("No shards found.")
+        return None
+
+    latest_shard = shards[-1]["ShardId"]
+
+    iterator = streams.get_shard_iterator(
+        StreamArn=stream_arn,
+        ShardId=latest_shard,
+        ShardIteratorType="LATEST")["ShardIterator"]
+
+    return iterator
+
+new_data_queue = queue.Queue()
+
+def listen_to_stream(db_handler, data_queue):
+    if DB_TYPE != "AWS":
+        return
+
+    try:
+        streams_client = boto3.client("dynamodbstreams", region_name=REGION_NAME)
+        shard_iterator = get_latest_iterator()
+
+        while True:
+            out = streams_client.get_records(ShardIterator=shard_iterator, Limit=10)
+            records = out.get("Records", [])
+
+            for record in records:
+                if record["eventName"] == "INSERT":
+                    new_image = record["dynamodb"]["NewImage"]
+                    parsed = {k: list(v.values())[0] for k, v in new_image.items()}
+
+                    if parsed.get('date') == db_handler.today_date_str:
+                        # print(f"New record: {parsed}")
+                        data_queue.put(parsed)
+                        db_handler.update_today_df_from_stream(parsed)
+
+            shard_iterator = out["NextShardIterator"]
+            time.sleep(5)
+
+    except Exception as e:
+        print(f"Error listening to stream: {e}")
+        time.sleep(10)
+
+def start_stream_listener(db_handler, data_queue):
+    """Start the stream listener in a separate thread"""
+    if DB_TYPE == "AWS":
+        stream_thread = threading.Thread(
+            target=listen_to_stream,
+            args=(db_handler, data_queue),
+            daemon=True
+        )
+        stream_thread.start()
+        print("Stream listener thread started")
 
 
 pio.templates.default = "plotly_dark"
@@ -255,6 +364,11 @@ app = dash.Dash(__name__,
 
 cache = Cache(app.server, config={'CACHE_TYPE': 'simple'})
 
+db = DatabaseHandler()
+
+if DB_TYPE == "AWS":
+    start_stream_listener(db, new_data_queue)
+
 temp_value = html.Div(id='temp_value', style={'font-size': '24px'})
 humidity_value = html.Div(id='humidity_value', style={'font-size': '24px'})
 eCO2_value = html.Div(id='eCO2_value', style={'font-size': '24px'})
@@ -263,7 +377,13 @@ app.layout = html.Div([
     html.H1('Weather Station Dashboard', className='text-center mb-4'),
     html.Div(id='browser-title', style={'display': 'none'}),
     html.Div(id='browser-title-values', style={'display': 'none'}),
-    dcc.Interval(id='interval-component', interval=60*1000, n_intervals=0),
+    html.Div(id='current-data-store', style={'display': 'none'}),
+    html.Div(id="notification-output"),
+    dcc.Store(id='time-range-store', data={'time-range': None}),
+    dcc.Store(id="aq-notification-trigger"),
+    dcc.Store(id="notification-permission"),
+    dcc.Store(id='last-notification-store', storage_type='memory', data=datetime.min),
+    dcc.Interval(id='update-interval', interval=10000, n_intervals=0),
     dbc.Container([
         dbc.Row([
             dbc.Col([
@@ -309,6 +429,12 @@ app.layout = html.Div([
                     value=False,
                     inputClassName="mr-2"
                 ),
+                dbc.Switch(
+                    id='notify-toggle',
+                    label='Air Quality Notifications',
+                    value=False,
+                    inputClassName="mr-2"
+                ),
                 html.H5("Aggregation and Chart Type"),
                 dbc.RadioItems(
                     id='aggregation-chart-selector',
@@ -331,8 +457,8 @@ app.layout = html.Div([
     ], fluid=True, className='dbc'),
 ])
 
-# update the browser title with the latest values
-app.clientside_callback(
+# Update the browser title with the latest values
+clientside_callback(
     """
     function(values) {
         const title = `${values} | Weather Dashboard`;
@@ -344,85 +470,132 @@ app.clientside_callback(
     [Input("browser-title-values", "children")]
 )
 
-# API calls for outdoor weather data
-@cache.memoize(timeout=CACHE_TIMEOUT)
-def get_outdoor_weather(time_range):
-    '''Retrieves outdoor weather data and saves it to a parquet file for caching. The data is downloaded at most once per day.'''
-    db = DatabaseHandler()
+# Request notification permission when the toggle is switched on
+clientside_callback(
+    """
+    async function(toggleValue) {
+        await Notification.requestPermission();
+
+        return null;
+    }
+    """,
+    Output("notification-permission", "data"),
+    Input("notify-toggle", "value"),
+    prevent_initial_call=True,
+)
+
+# Trigger the notification when the eCO2 level is high
+clientside_callback(
+    """
+    function(message, notifyToggle) {
+        if (message) {
+            if (Notification.permission === 'granted' && notifyToggle) {
+                new Notification("Air Quality Alert", { body: message });
+            }
+        }
+        return null;
+    }
+    """,
+    Output("notification-output", "children"),
+    Input("aq-notification-trigger", "data"),
+    Input("notify-toggle", "value"),
+    prevent_initial_call=True
+)
+
+
+@cache.memoize()
+def get_outdoor_weather(time_range, _=None):
+    '''Retrieves and caches outdoor weather data in memory using Flask-Caching.'''
     min_date = db.get_data_by_timerange(time_range)["Time"].min().date()
-    db.close()
-    GATHER_DATA = True
+    current_date = datetime.now().date()
+    now = datetime.now()
+
+    # Set up cache and retry
+    cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
+    retry_session = retry(cache_session, retries=1, backoff_factor=0.2)
+    openmeteo = openmeteo_requests.Client(session=retry_session)
+
+    def fetch_today_data():
+        try:
+            url = "https://api.open-meteo.com/v1/forecast"
+            params = {
+                "latitude": LATITUDE,
+                "longitude": LONGITUDE,
+                "minutely_15": ["temperature_2m", "relative_humidity_2m"],
+                "timezone": "auto",
+                "past_days": 1,
+                "forecast_days": 1
+            }
+
+            responses = openmeteo.weather_api(url, params=params)
+            response = responses[0]
+            data_forecast = response.Minutely15()
+            timezone_offset = pytz.timezone(response.Timezone()).utcoffset(now).total_seconds()
+
+            return pd.DataFrame({
+                "Time": pd.date_range(
+                    start=pd.to_datetime(data_forecast.Time(), unit="s") + pd.Timedelta(seconds=timezone_offset),
+                    end=pd.to_datetime(data_forecast.TimeEnd(), unit="s") + pd.Timedelta(seconds=timezone_offset),
+                    freq=pd.Timedelta(seconds=data_forecast.Interval()),
+                    inclusive="left"
+                ),
+                'Temperature': data_forecast.Variables(0).ValuesAsNumpy(),
+                'Humidity': data_forecast.Variables(1).ValuesAsNumpy(),
+                # 'Precipitation': data_forecast.Variables(2).ValuesAsNumpy()
+            }).dropna()
+        except Exception as e:
+            print(f"Error fetching today's weather data: {e}")
+            return pd.DataFrame(columns=['Time', 'Temperature', 'Humidity'])
+
+    # Load full dataset from cache
+    outdoor_data = pd.DataFrame(columns=['Time', 'Temperature', 'Humidity'])
 
     try:
-        df_export = pd.read_parquet('weather_data_outdoor.parquet')
-        most_recent_data = df_export['Time'].max().date()
-        if most_recent_data == datetime.now().date():
-            GATHER_DATA = False
-
-    except FileNotFoundError:
-        df_export = pd.DataFrame(columns=['Time', 'Temperature', 'Humidity', 'Precipitation'])
-
-
-    if GATHER_DATA:
-        cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
-        retry_session = retry(cache_session, retries=1, backoff_factor=0.2)
-        openmeteo = openmeteo_requests.Client(session=retry_session)
-
-        current_date = datetime.now().date()
-        daily_data = pd.DataFrame()
-
+        print("Historical weather data refetched")
+        # Historical data
         url = "https://archive-api.open-meteo.com/v1/archive"
         params = {
             "latitude": LATITUDE,
             "longitude": LONGITUDE,
-            "hourly": ["temperature_2m", "relative_humidity_2m", "precipitation"],
+            "hourly": ["temperature_2m", "relative_humidity_2m"],
             "timezone": "auto",
             "start_date": min_date - timedelta(days=6),
-            "end_date": current_date - timedelta(days=6),
+            "end_date": current_date - timedelta(days=2),
         }
 
         responses = openmeteo.weather_api(url, params=params)
         response = responses[0]
         data_historical = response.Hourly()
+        timezone_offset = pytz.timezone(response.Timezone()).utcoffset(now).total_seconds()
 
-        url = "https://api.open-meteo.com/v1/forecast"
-        params = {
-            "latitude": LATITUDE,
-            "longitude": LONGITUDE,
-            "minutely_15": ["temperature_2m", "relative_humidity_2m", "precipitation"],
-            "timezone": "auto",
-            "past_days": 5,
-            "forecast_days": 1
-        }
+        historical_data = pd.DataFrame({
+            "Time": pd.date_range(
+                start=pd.to_datetime(data_historical.Time(), unit="s") + pd.Timedelta(seconds=timezone_offset),
+                end=pd.to_datetime(data_historical.TimeEnd(), unit="s") + pd.Timedelta(seconds=timezone_offset),
+                freq=pd.Timedelta(seconds=data_historical.Interval()),
+                inclusive="left"
+            ),
+            'Temperature': data_historical.Variables(0).ValuesAsNumpy(),
+            'Humidity': data_historical.Variables(1).ValuesAsNumpy(),
+            # 'Precipitation': data_historical.Variables(2).ValuesAsNumpy()
+        }).dropna()
 
-        responses = openmeteo.weather_api(url, params=params)
-        response = responses[0]
-        data_forecast = response.Minutely15()
-        timezone_offset = pytz.timezone(response.Timezone()).utcoffset(datetime.now()).total_seconds()
+        # Load today's data from forecast
+        today_data = fetch_today_data()
 
-        for data in [data_historical, data_forecast]:
-            response_df = pd.DataFrame({
-                "Time": pd.date_range(
-                    start=pd.to_datetime(data.Time(), unit = "s") + pd.Timedelta(seconds=timezone_offset),
-                    end=pd.to_datetime(data.TimeEnd(), unit = "s") + pd.Timedelta(seconds=timezone_offset),
-                    freq=pd.Timedelta(seconds=data.Interval()),
-                    inclusive="left"
-                ),
-                'Temperature': data.Variables(0).ValuesAsNumpy(),
-                'Humidity': data.Variables(1).ValuesAsNumpy(),
-                'Precipitation': data.Variables(2).ValuesAsNumpy()
-            })
-            daily_data = pd.concat([daily_data.dropna(), response_df.dropna()])
+        full_data = pd.concat([historical_data, today_data])
 
-        df_export = pd.concat([df_export, daily_data]).drop_duplicates()
-        df_export = df_export.sort_values(by='Time')
-        df_export['Time'] = pd.to_datetime(df_export['Time'], unit='s', format='%Y-%m-%d %H:%M:%S')
-        df_export.to_parquet('weather_data_outdoor.parquet')
+        full_data['Time'] = pd.to_datetime(full_data['Time'])
+        outdoor_data = full_data.sort_values(by='Time')
 
-    return df_export
+    except Exception as e:
+        print(f"Error fetching outdoor weather data: {e}")
+        return pd.DataFrame(columns=['Time', 'Temperature', 'Humidity'])
+
+    return outdoor_data.drop_duplicates()
 
 
-# if the full time range is used, the granularity is reduced to avoid loading too many data points.
+# If the full time range is used, the granularity is reduced to avoid loading too many data points.
 @app.callback(
     Output('granularity-slider', 'value'),
     [Input('current-time-range', 'value'),
@@ -438,48 +611,76 @@ def update_granularity_slider(current_time_range, current_granularity):
         return current_granularity
 
 
-# Update the values of the widgets
 @app.callback(
     [Output('temp_value', 'children'),
      Output('humidity_value', 'children'),
      Output('eCO2_value', 'children'),
-     Output('browser-title-values', 'children')],
-    [Input('interval-component', 'n_intervals')]
+     Output('browser-title-values', 'children'),
+     Output('aq-notification-trigger', 'data'),
+     Output('last-notification-store', 'data')],
+    [Input('update-interval', 'n_intervals')],
+    [State('last-notification-store', 'data')]
 )
-@cache.memoize(timeout=CACHE_TIMEOUT)
-def update_widget_values(n_intervals):
-    db = DatabaseHandler()
+def update_widget_values(n_intervals, last_aq_notification):
     last_row = db.get_latest_values()
-    db.close()
-    
-    if last_row["eCO2"] > 1000:
-        title = f"+++AIR+++ {last_row['eCO2']:.0f}ppb | {last_row['Temperature']:.2f}°C | {last_row['Humidity']:.2f}%"
-    else:
-        title = f"{last_row['eCO2']:.0f}ppb | {last_row['Temperature']:.2f}°C | {last_row['Humidity']:.2f}%"
 
-    return (f"Temperature: {last_row['Temperature']:.2f}°C",
-            f"Humidity: {last_row['Humidity']:.2f}%",
-            f"eCO2: {int(last_row['eCO2'])}ppb",
-            title)
+    if last_row is None:
+        return "Temperature: --°C", "Humidity: --%", "eCO2: -- ppb", "--°C | --% | -- ppb", None
+
+    temperature = f"{last_row['Temperature']:.2f}°C"
+    humidity = f"{last_row['Humidity']:.2f}%"
+    eco2 = int(last_row["eCO2"])
+    title = f"{eco2}ppb | {temperature} | {humidity}"
+
+    notify = None
+    now = datetime.now()
+    last_aq_notification = datetime.fromisoformat(last_aq_notification)
+    if eco2 > 1000 and (now - last_aq_notification) > notification_cooldown:
+        last_aq_notification = now
+        title = f"+++AIR+++ {title}"
+        notify = f"⚠️ High eCO2 levels: {eco2}ppb"
+
+    return f"Temperature: {temperature}", f"Humidity: {humidity}", f"eCO2: {eco2}ppb", title, notify, last_aq_notification
 
 
-# Graph update function    
+# Process new data from stream for the graph updates
+@app.callback(
+    Output('current-data-store', 'children'),
+    [Input('update-interval', 'n_intervals')]
+)
+def process_new_data_for_graphs(n_intervals):
+    try:
+        updated = False
+        while not new_data_queue.empty():
+            new_record = new_data_queue.get_nowait()
+            # print(f"Processing new record from queue for graphs: {new_record}")
+            updated = True
+        
+        # Return a timestamp to trigger the graph update callback if there are updates
+        if updated:
+            return str(datetime.now().timestamp())
+        return "no-update"
+    except queue.Empty:
+        return "no-update"
+
+
 @app.callback(
     Output('main-graph', 'figure'),
-    [Input('granularity-slider', 'value'),
-     Input('current-time-range', 'value'),
-     Input('aggregation-chart-selector', 'value'),
-     Input('outdoor-toggle', 'value')]
+    Output('time-range-store', 'data'),
+    Input('granularity-slider', 'value'),
+    Input('current-time-range', 'value'),
+    Input('aggregation-chart-selector', 'value'),
+    Input('outdoor-toggle', 'value'),
+    Input('current-data-store', 'children'),
+    State('main-graph', 'relayoutData'),
+    State('time-range-store', 'data')
 )
-@cache.memoize(timeout=CACHE_TIMEOUT)
-def update_daily_graph(granularity, time_range, aggregation_chart_selector, include_outdoor):
+def update_daily_graph(granularity, time_range, aggregation_chart_selector, include_outdoor, data_store_trigger, relayout_data, previous_time_range):
     aggregation_type, chart_type = aggregation_chart_selector.split('-')
-    db = DatabaseHandler()
     df = db.get_data_by_timerange(time_range)
-    db.close()
-
+    
     if include_outdoor:
-        df_outdoor = get_outdoor_weather(time_range)
+        df_outdoor = get_outdoor_weather(time_range, datetime.now().date())
         #interpolate outdoor data according to granularity
         df_outdoor = df_outdoor.set_index('Time').resample(str(granularity) + "s").interpolate().reset_index()
         df = df.sort_values("Time")
@@ -498,7 +699,6 @@ def update_daily_graph(granularity, time_range, aggregation_chart_selector, incl
     if include_outdoor:
         temp_range = [min(temp_range[0], df["Temperature_outdoor"].min()*0.8), max(temp_range[1], df["Temperature_outdoor"].max()*1.1)]
         hum_range = [min(hum_range[0], df["Humidity_outdoor"].min()*0.8), max(hum_range[1], df["Humidity_outdoor"].max()*1.1)]
-
 
     # pre-define colors for the charts  
     color_dict = {
@@ -595,7 +795,26 @@ def update_daily_graph(granularity, time_range, aggregation_chart_selector, incl
     fig_merged.add_shape(type="rect", x0=x0, x1=x1, y0=40, y1=60, fillcolor="green", opacity=0.1, row=2, col=1)
     fig_merged.add_shape(type="rect", x0=x0, x1=x1, y0=0, y1=1000, fillcolor="green", opacity=0.1, row=3, col=1)
 
-    return fig_merged
+    previous_time_range = dash.callback_context.states['time-range-store.data']['time-range']
+
+    if relayout_data and time_range == previous_time_range:
+        layout_updates = {}
+
+        for key, value in relayout_data.items():
+            if ".range[" in key:
+                axis_key, range_idx = key.split(".range[")
+                range_idx = int(range_idx.rstrip("]"))
+
+                if axis_key not in layout_updates:
+                    layout_updates[axis_key] = [None, None]
+
+                layout_updates[axis_key][range_idx] = value
+
+        for axis, range_vals in layout_updates.items():
+            fig_merged.update_layout({axis: dict(range=range_vals)})
+
+    return fig_merged, {'time-range': time_range}
+
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8050, debug=True)

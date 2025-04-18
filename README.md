@@ -1,6 +1,6 @@
 # Weather Dashboard
 
-A simple weather monitoring system using the ENS160+AHT21 sensor. Measured data is saved either to a DynamoDB on AWS or a SQLite database. The data can then be plotted in an interactive dashboard, including weather report data using the open-meteo API if desired.
+A simple weather monitoring system using the ENS160+AHT21 sensor. Measured data is saved either to a DynamoDB on AWS (the data volumes should be covered by the free tier) or a SQLite database. The data can then be plotted in an interactive dashboard, including weather report data using the open-meteo API if desired.
 
 # Table of Contents
 1. [Features](#features)
@@ -10,8 +10,8 @@ A simple weather monitoring system using the ENS160+AHT21 sensor. Measured data 
     3. [Setting up the dashboard as a docker container](#setting-up-the-dashboard-as-a-docker-container)
 
 ## Features
-- Real-time display of measured temperature, humidity, and eCO2 levels
-- save data locally or on AWS
+- Real-time streaming display of measured temperature, humidity, and eCO2 levels
+- save data on AWS DynamoDB or a local SQLite database (not tested anymore for newer versions)
 - Integration with API-based weather data
 - Multiple visualization options with adjustable time ranges and granularity
 ![weather_dashboard_3](https://github.com/user-attachments/assets/8e0bcacc-5f5a-46bb-9f2d-7ec137f032e3)
