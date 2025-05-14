@@ -277,7 +277,6 @@ def normalize_aws_df(aws_df):
     return aws_df
 
 
-
 def get_latest_iterator():
     dynamodb = boto3.client("dynamodb", region_name=REGION_NAME)
     streams = boto3.client("dynamodbstreams", region_name=REGION_NAME)
@@ -301,14 +300,14 @@ def get_latest_iterator():
 new_data_queue = queue.Queue()
 
 def listen_to_stream(db_handler, data_queue):
-    if DB_TYPE != "AWS":
-        return
+    streams_client = boto3.client("dynamodbstreams", region_name=REGION_NAME)
+    shard_iterator = None
 
-    try:
-        streams_client = boto3.client("dynamodbstreams", region_name=REGION_NAME)
-        shard_iterator = get_latest_iterator()
+    while True:
+        try:
+            if not shard_iterator:
+                shard_iterator = get_latest_iterator()
 
-        while True:
             out = streams_client.get_records(ShardIterator=shard_iterator, Limit=10)
             records = out.get("Records", [])
 
@@ -325,13 +324,15 @@ def listen_to_stream(db_handler, data_queue):
             shard_iterator = out["NextShardIterator"]
             time.sleep(5)
 
-    except Exception as e:
-        print(f"Error listening to stream: {e}")
-        time.sleep(10)
+        except Exception as e:
+            print(f"Error getting shard iterator: {e} \nUsing new iterator")
+            time.sleep(5)
+            shard_iterator = None
+
 
 def start_stream_listener(db_handler, data_queue):
-    """Start the stream listener in a separate thread"""
-    if DB_TYPE == "AWS":
+    global stream_thread
+    if stream_thread is None or not stream_thread.is_alive():
         stream_thread = threading.Thread(
             target=listen_to_stream,
             args=(db_handler, data_queue),
@@ -339,6 +340,8 @@ def start_stream_listener(db_handler, data_queue):
         )
         stream_thread.start()
         print("Stream listener thread started")
+    else:
+        print("Stream listener already running.")
 
 
 pio.templates.default = "plotly_dark"
@@ -367,6 +370,7 @@ cache = Cache(app.server, config={'CACHE_TYPE': 'simple'})
 db = DatabaseHandler()
 
 if DB_TYPE == "AWS":
+    stream_thread = None
     start_stream_listener(db, new_data_queue)
 
 temp_value = html.Div(id='temp_value', style={'font-size': '24px'})
