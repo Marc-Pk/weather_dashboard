@@ -1,4 +1,5 @@
 #!/usr/bin/python
+import logging
 import board
 import adafruit_ens160
 import adafruit_ahtx0
@@ -6,6 +7,9 @@ from decimal import Decimal
 from time import sleep
 from statistics import median
 from datetime import datetime
+
+# Setup for logging
+logging.basicConfig(filename="weather_sensor.log", level=logging.ERROR, datefmt="%Y-%m-%d %H:%M:%S", format="#######\n%(asctime)s\n%(message)s\n\n")
 
 # Set the database type to either "LOCAL" or "AWS"
 DB_TYPE = "AWS"
@@ -61,23 +65,26 @@ while True:
         median_data_raw = (data[0][0].replace(second=0, microsecond=0), median([x[1] for x in data]), median([x[2] for x in data]), median([x[3] for x in data]), median([x[4] for x in data]))
         median_data = (median_data_raw[0].strftime('%Y-%m-%d'), median_data_raw[0].strftime('%Y-%m-%d %H:%M:%S'), round(median_data_raw[1], 2), round(median_data_raw[2], 2), round(median_data_raw[3]), round(median_data_raw[4]))
 
-        # Insert data into the DynamoDB database
-        if DB_TYPE == "AWS":
-            response = table.put_item(
-                Item={
-                    'date': str(median_data[0]),
-                    'datetime': str(median_data[1]),
-                    'Humidity': Decimal(str(median_data[2])),
-                    'Temperature': Decimal(str(median_data[3])),
-                    'TVOC': Decimal(str(median_data[4])),
-                    'eCO2': Decimal(str(median_data[5]))
-                }
-            )       
+        try:
+            # Insert data into the DynamoDB database
+            if DB_TYPE == "AWS":
+                response = table.put_item(
+                    Item={
+                        'date': str(median_data[0]),
+                        'datetime': str(median_data[1]),
+                        'Humidity': Decimal(str(median_data[2])),
+                        'Temperature': Decimal(str(median_data[3])),
+                        'TVOC': Decimal(str(median_data[4])),
+                        'eCO2': Decimal(str(median_data[5]))
+                    }
+                )       
 
-        # Alternatively, insert data into the SQLite database
-        else:
-            cursor.execute('''INSERT INTO sensor_data (date, datetime, Humidity, Temperature, TVOC, eCO2) VALUES (?, ?, ?, ?, ?, ?)''', median_data)
-            conn.commit()
-       
-        # Clear data
-        data = []
+            # Alternatively, insert data into the SQLite database
+            else:
+                cursor.execute('''INSERT INTO sensor_data (date, datetime, Humidity, Temperature, TVOC, eCO2) VALUES (?, ?, ?, ?, ?, ?)''', median_data)
+                conn.commit()
+        
+            # Clear data
+            data = []
+        except Exception as e:
+            logging.exception(e)
