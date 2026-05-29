@@ -402,7 +402,6 @@ def calculate_dew_point(temp_celsius, humidity_percent):
     return (c * gamma) / (b - gamma)
 
 
-
 pio.templates.default = "plotly_dark"
 
 
@@ -651,12 +650,12 @@ def get_outdoor_weather(time_range, _=None):
                 pytz.timezone(response.Timezone()).utcoffset(now).total_seconds()
             )
 
-            start_time = datetime.fromtimestamp(
-                data_forecast.Time(), tz=pytz.utc
-            ) + timedelta(seconds=timezone_offset)
-            end_time = datetime.fromtimestamp(
-                data_forecast.TimeEnd(), tz=pytz.utc
-            ) + timedelta(seconds=timezone_offset)
+            start_time = datetime.fromtimestamp(data_forecast.Time()) + timedelta(
+                seconds=timezone_offset
+            )
+            end_time = datetime.fromtimestamp(data_forecast.TimeEnd()) + timedelta(
+                seconds=timezone_offset
+            )
             interval = int(data_forecast.Interval())
 
             times = []
@@ -669,8 +668,10 @@ def get_outdoor_weather(time_range, _=None):
                 pl.DataFrame(
                     {
                         "Time": times,
-                        "Temperature": data_forecast.Variables(0).ValuesAsNumpy(),
-                        "Humidity": data_forecast.Variables(1).ValuesAsNumpy(),
+                        "Temperature_outdoor": data_forecast.Variables(
+                            0
+                        ).ValuesAsNumpy(),
+                        "Humidity_outdoor": data_forecast.Variables(1).ValuesAsNumpy(),
                     }
                 )
                 .with_columns(pl.col("Time").cast(pl.Datetime))
@@ -678,10 +679,22 @@ def get_outdoor_weather(time_range, _=None):
             )
         except Exception as e:
             print(f"Error fetching today's weather data: {e}")
-            return pl.DataFrame(columns=["Time", "Temperature", "Humidity"])
+            return pl.DataFrame(
+                schema={
+                    "Time": pl.Datetime,
+                    "Temperature_outdoor": pl.Float64,
+                    "Humidity_outdoor": pl.Float64,
+                }
+            )
 
     # Load full dataset from cache
-    outdoor_data = pl.DataFrame(columns=["Time", "Temperature", "Humidity"])
+    outdoor_data = pl.DataFrame(
+        schema={
+            "Time": pl.Datetime,
+            "Temperature_outdoor": pl.Float64,
+            "Humidity_outdoor": pl.Float64,
+        }
+    )
 
     try:
         print("Historical weather data refetched")
@@ -703,12 +716,12 @@ def get_outdoor_weather(time_range, _=None):
             pytz.timezone(response.Timezone()).utcoffset(now).total_seconds()
         )
 
-        start_time = datetime.fromtimestamp(
-            data_historical.Time(), tz=pytz.utc
-        ) + timedelta(seconds=timezone_offset)
-        end_time = datetime.fromtimestamp(
-            data_historical.TimeEnd(), tz=pytz.utc
-        ) + timedelta(seconds=timezone_offset)
+        start_time = datetime.fromtimestamp(data_historical.Time()) + timedelta(
+            seconds=timezone_offset
+        )
+        end_time = datetime.fromtimestamp(data_historical.TimeEnd()) + timedelta(
+            seconds=timezone_offset
+        )
         interval = int(data_historical.Interval())
 
         times = []
@@ -721,8 +734,8 @@ def get_outdoor_weather(time_range, _=None):
             pl.DataFrame(
                 {
                     "Time": times,
-                    "Temperature": data_historical.Variables(0).ValuesAsNumpy(),
-                    "Humidity": data_historical.Variables(1).ValuesAsNumpy(),
+                    "Temperature_outdoor": data_historical.Variables(0).ValuesAsNumpy(),
+                    "Humidity_outdoor": data_historical.Variables(1).ValuesAsNumpy(),
                 }
             )
             .with_columns(pl.col("Time").cast(pl.Datetime))
@@ -738,7 +751,13 @@ def get_outdoor_weather(time_range, _=None):
 
     except Exception as e:
         print(f"Error fetching outdoor weather data: {e}")
-        return pl.DataFrame(columns=["Time", "Temperature", "Humidity"])
+        return pl.DataFrame(
+            schema={
+                "Time": pl.Datetime,
+                "Temperature_outdoor": pl.Float64,
+                "Humidity_outdoor": pl.Float64,
+            }
+        )
 
     # Ensure Time is datetime
     if "Time" in outdoor_data.columns and outdoor_data["Time"].dtype != pl.Datetime:
@@ -828,7 +847,6 @@ def process_new_data_for_graphs(n_intervals):
         updated = False
         while not new_data_queue.empty():
             _ = new_data_queue.get_nowait()
-            # print(f"Processing new record from queue for graphs: {_}")
             updated = True
 
         # Return a timestamp to trigger the graph update callback if there are updates
@@ -864,32 +882,6 @@ def update_daily_graph(
     aggregation_type, chart_type = aggregation_chart_selector.split("-")
     df = db.get_data_by_timerange(time_range)
 
-    if include_outdoor:
-        df_outdoor = get_outdoor_weather(time_range, datetime.now().date())
-        # Ensure Time is datetime before truncate
-        if "Time" in df_outdoor.columns and df_outdoor["Time"].dtype != pl.Datetime:
-            df_outdoor = df_outdoor.with_columns(pl.col("Time").cast(pl.Datetime))
-        # resample outdoor data according to granularity
-        df_outdoor = (
-            df_outdoor.with_columns(
-                pl.col("Time").dt.truncate(f"{granularity}s").alias("Time_bucket")
-            )
-            .group_by("Time_bucket")
-            .agg([pl.col("Temperature").mean(), pl.col("Humidity").mean()])
-            .sort("Time_bucket")
-            .with_columns(pl.col("Time_bucket").alias("Time"))
-            .drop("Time_bucket")
-        )
-
-        df = df.sort("Time")
-        df = df.join_asof(
-            df_outdoor, on="Time", by_strategy="nearest_left", suffix="_outdoor"
-        )
-
-    # Ensure Time is datetime before truncate
-    if "Time" in df.columns and df["Time"].dtype != pl.Datetime:
-        df = df.with_columns(pl.col("Time").cast(pl.Datetime))
-
     df = (
         df.with_columns(
             pl.col("Time").dt.truncate(f"{granularity}s").alias("Time_bucket")
@@ -907,6 +899,16 @@ def update_daily_graph(
         .drop("Time_bucket")
     )
 
+    if include_outdoor:
+        df_outdoor = get_outdoor_weather(time_range, datetime.now().date())
+        df = df.join(df_outdoor, on="Time", how="left")
+        df = df.with_columns(
+            [
+                pl.col("Temperature_outdoor").interpolate(),
+                pl.col("Humidity_outdoor").interpolate(),
+            ]
+        )
+
     df = df.with_columns(pl.col("Time").dt.time().alias("clock_time"))
 
     unique_days = df.select(pl.col("Time").dt.date().unique()).to_series().to_list()
@@ -914,19 +916,43 @@ def update_daily_graph(
         df.select(pl.col("Time").dt.ordinal_day().unique()).to_series().unique()
     )
 
-    temp_range = [df["Temperature"].min() * 0.8, df["Temperature"].max() * 1.1]
-    hum_range = [df["Humidity"].min() * 0.8, df["Humidity"].max() * 1.1]
-    eCO2_range = [df["eCO2"].min() * 0.8, df["eCO2"].max() * 1.1]
+    t_min = df["Temperature"].min()
+    t_max = df["Temperature"].max()
+    temp_range = [
+        t_min * 0.8 if t_min is not None else 15.0,
+        t_max * 1.1 if t_max is not None else 30.0,
+    ]
+
+    h_min = df["Humidity"].min()
+    h_max = df["Humidity"].max()
+    hum_range = [
+        h_min * 0.8 if h_min is not None else 20.0,
+        h_max * 1.1 if h_max is not None else 80.0,
+    ]
+
+    e_min = df["eCO2"].min()
+    e_max = df["eCO2"].max()
+    eCO2_range = [
+        e_min * 0.8 if e_min is not None else 400.0,
+        e_max * 1.1 if e_max is not None else 1000.0,
+    ]
 
     if include_outdoor and "Temperature_outdoor" in df.columns:
-        temp_range = [
-            min(temp_range[0], df["Temperature_outdoor"].min() * 0.8),
-            max(temp_range[1], df["Temperature_outdoor"].max() * 1.1),
-        ]
-        hum_range = [
-            min(hum_range[0], df["Humidity_outdoor"].min() * 0.8),
-            max(hum_range[1], df["Humidity_outdoor"].max() * 1.1),
-        ]
+        t_out_min = df["Temperature_outdoor"].min()
+        t_out_max = df["Temperature_outdoor"].max()
+        if t_out_min is not None and t_out_max is not None:
+            temp_range = [
+                min(temp_range[0], t_out_min * 0.8),
+                max(temp_range[1], t_out_max * 1.1),
+            ]
+
+        h_out_min = df["Humidity_outdoor"].min()
+        h_out_max = df["Humidity_outdoor"].max()
+        if h_out_min is not None and h_out_max is not None:
+            hum_range = [
+                min(hum_range[0], h_out_min * 0.8),
+                max(hum_range[1], h_out_max * 1.1),
+            ]
 
     if include_dew_point:
         df = df.with_columns(
@@ -934,10 +960,13 @@ def update_daily_graph(
                 "Temperature_dew"
             )
         )
-        temp_range = [
-            min(temp_range[0], df["Temperature_dew"].min() * 0.8),
-            max(temp_range[1], df["Temperature_dew"].max() * 1.1),
-        ]
+        t_dew_min = df["Temperature_dew"].min()
+        t_dew_max = df["Temperature_dew"].max()
+        if t_dew_min is not None and t_dew_max is not None:
+            temp_range = [
+                min(temp_range[0], t_dew_min * 0.8),
+                max(temp_range[1], t_dew_max * 1.1),
+            ]
 
     # pre-define colors for the charts
     color_dict = {
@@ -1079,7 +1108,6 @@ def update_daily_graph(
                         trace.line.color = f"rgb{color_dict[dew_column]['color']}"
 
                     fig_merged.add_trace(trace, row=column_index + 1, col=1)
-
 
             fig_merged.update_yaxes(
                 title_text=column_name,
