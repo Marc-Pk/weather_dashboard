@@ -12,6 +12,7 @@ import os
 import threading
 import time
 import queue
+import math
 from dash import dcc, html, clientside_callback
 from dash.dependencies import Output, Input, State
 from plotly.subplots import make_subplots
@@ -33,9 +34,8 @@ DB_PATH = os.getenv("DB_PATH", r"sensor-data")
 REGION_NAME = os.getenv("AWS_REGION", "us-east-1")
 
 # Coordinates for API weather data
-LATITUDE = float(os.getenv("LATITUDE", 49.0094))
-LONGITUDE = float(os.getenv("LONGITUDE", 8.4044))
-
+LATITUDE = float(os.getenv("LATITUDE", 50.7463))
+LONGITUDE = float(os.getenv("LONGITUDE", 7.081))
 # Create a global queue for new data from the stream
 new_data_queue = queue.Queue()
 
@@ -361,6 +361,34 @@ def start_stream_listener(db_handler, data_queue):
         print("Stream listener already running.")
 
 
+def calculate_felt_temperature(temp_celsius, humidity_percent):
+    """
+    Calculate felt temperature (wet-bulb temperature) using the provided formula.
+
+    Formula: Tw = T*arctan(0.151977*RH + 8.313659) + 0.00391838*RH^3*arctan(0.023101*RH)
+                  - arctan(RH - 1.676331) + arctan(T + RH) - 4.686035
+
+    Args:
+        temp_celsius: Air temperature in Celsius
+        humidity_percent: Relative humidity in percent (0-100)
+
+    Returns:
+        Felt temperature in Celsius
+    """
+    T = temp_celsius
+    RH = humidity_percent
+
+    felt_temp = (
+        T * math.atan(0.151977 * RH + 8.313659)
+        + 0.00391838 * (RH**3) * math.atan(0.023101 * RH)
+        - math.atan(RH - 1.676331)
+        + math.atan(T + RH)
+        - 4.686035
+    )
+
+    return felt_temp
+
+
 pio.templates.default = "plotly_dark"
 
 dbc_css = "https://cdn.jsdelivr.net/gh/AnnMarieW/dash-bootstrap-templates/dbc.min.css"
@@ -394,6 +422,7 @@ if DB_TYPE == "AWS":
 temp_value = html.Div(id="temp_value", style={"font-size": "24px"})
 humidity_value = html.Div(id="humidity_value", style={"font-size": "24px"})
 eCO2_value = html.Div(id="eCO2_value", style={"font-size": "24px"})
+felt_temp_value = html.Div(id="felt_temp_value", style={"font-size": "24px"})
 
 app.layout = html.Div(
     [
@@ -423,6 +452,9 @@ app.layout = html.Div(
                                             ),
                                             html.Div(
                                                 humidity_value, className="text-nowrap"
+                                            ),
+                                            html.Div(
+                                                felt_temp_value, className="text-nowrap"
                                             ),
                                             html.Div(
                                                 eCO2_value, className="text-nowrap"
@@ -468,6 +500,12 @@ app.layout = html.Div(
                                 dbc.Switch(
                                     id="notify-toggle",
                                     label="Air Quality Notifications",
+                                    value=False,
+                                    inputClassName="mr-2",
+                                ),
+                                dbc.Switch(
+                                    id="felt-temp-toggle",
+                                    label="Show Felt Temperature",
                                     value=False,
                                     inputClassName="mr-2",
                                 ),
@@ -686,6 +724,7 @@ def update_granularity_slider(current_time_range, current_granularity):
     [
         Output("temp_value", "children"),
         Output("humidity_value", "children"),
+        Output("felt_temp_value", "children"),
         Output("eCO2_value", "children"),
         Output("browser-title-values", "children"),
         Output("aq-notification-trigger", "data"),
@@ -701,13 +740,19 @@ def update_widget_values(n_intervals, last_aq_notification):
         return (
             "Temperature: --°C",
             "Humidity: --%",
+            "Felt Temperature: --°C",
             "eCO2: -- ppb",
             "--°C | --% | -- ppb",
             None,
+            datetime.min.isoformat(),
         )
 
     temperature = f"{last_row['Temperature']:.2f}°C"
     humidity = f"{last_row['Humidity']:.2f}%"
+    felt_temp = calculate_felt_temperature(
+        last_row["Temperature"], last_row["Humidity"]
+    )
+    felt_temp_str = f"{felt_temp:.2f}°C"
     eco2 = int(last_row["eCO2"])
     title = f"{eco2}ppb | {temperature} | {humidity}"
 
@@ -722,10 +767,11 @@ def update_widget_values(n_intervals, last_aq_notification):
     return (
         f"Temperature: {temperature}",
         f"Humidity: {humidity}",
+        f"Felt Temperature: {felt_temp_str}",
         f"eCO2: {eco2}ppb",
         title,
         notify,
-        last_aq_notification,
+        last_aq_notification.isoformat(),
     )
 
 
@@ -756,6 +802,7 @@ def process_new_data_for_graphs(n_intervals):
     Input("current-time-range", "value"),
     Input("aggregation-chart-selector", "value"),
     Input("outdoor-toggle", "value"),
+    Input("felt-temp-toggle", "value"),
     Input("current-data-store", "children"),
     State("main-graph", "relayoutData"),
     State("time-range-store", "data"),
@@ -765,6 +812,7 @@ def update_daily_graph(
     time_range,
     aggregation_chart_selector,
     include_outdoor,
+    include_felt_temp,
     data_store_trigger,
     relayout_data,
     previous_time_range,
@@ -806,6 +854,16 @@ def update_daily_graph(
             max(hum_range[1], df["Humidity_outdoor"].max() * 1.1),
         ]
 
+    if include_felt_temp:
+        df["Temperature_felt"] = df.apply(
+            lambda row: calculate_felt_temperature(row["Temperature"], row["Humidity"]),
+            axis=1,
+        )
+        temp_range = [
+            min(temp_range[0], df["Temperature_felt"].min() * 0.8),
+            max(temp_range[1], df["Temperature_felt"].max() * 1.1),
+        ]
+
     # pre-define colors for the charts
     color_dict = {
         "Temperature": {"color": (239, 85, 59), "range": temp_range},
@@ -813,6 +871,7 @@ def update_daily_graph(
         "eCO2": {"color": (0, 204, 150), "range": eCO2_range},
         "Temperature_outdoor": {"color": (255, 165, 0), "range": temp_range},
         "Humidity_outdoor": {"color": (0, 190, 255), "range": hum_range},
+        "Temperature_felt": {"color": (200, 50, 50), "range": temp_range},
     }
 
     # fade from white to the color_dict values by the number of days
@@ -844,6 +903,10 @@ def update_daily_graph(
             f"rgb{fade_to_white(color_dict['Humidity_outdoor']['color'], day_index, n_days)}"
             for day_index in range(n_days)
         ],
+        "Temperature_felt": [
+            f"rgb{fade_to_white(color_dict['Temperature_felt']['color'], day_index, n_days)}"
+            for day_index in range(n_days)
+        ],
     }
 
     figures = {}
@@ -851,6 +914,8 @@ def update_daily_graph(
     columns_to_plot = ["Temperature", "Humidity", "eCO2"]
     if include_outdoor:
         columns_to_plot.extend(["Temperature_outdoor", "Humidity_outdoor"])
+    if include_felt_temp:
+        columns_to_plot.append("Temperature_felt")
 
     for column in columns_to_plot:
         figures[column] = go.Figure()
@@ -861,8 +926,10 @@ def update_daily_graph(
                         x=df["clock_time"],
                         y=df[column],
                         name=f"{column} (Sensor)"
-                        if "_outdoor" not in column
-                        else f"{column.replace('_outdoor', '')} (Outdoor)",
+                        if "_outdoor" not in column and "_felt" not in column
+                        else f"{column.replace('_outdoor', '')} (Outdoor)"
+                        if "_outdoor" in column
+                        else "Temperature (Felt)",
                     )
                 )
         elif aggregation_type == "full":
@@ -873,8 +940,10 @@ def update_daily_graph(
                         y=df[column],
                         line_shape="spline",
                         name=f"{column} (Sensor)"
-                        if "_outdoor" not in column
-                        else f"{column.replace('_outdoor', '')} (Outdoor)",
+                        if "_outdoor" not in column and "_felt" not in column
+                        else f"{column.replace('_outdoor', '')} (Outdoor)"
+                        if "_outdoor" in column
+                        else "Temperature (Felt)",
                     )
                 )
         elif aggregation_type == "stacked":
@@ -890,7 +959,7 @@ def update_daily_graph(
                     trace = go.Scatter(
                         x=df_day["clock_time"],
                         y=df_day[column],
-                        name=f"{str(day)} - {'Sensor' if '_outdoor' not in column else 'Outdoor'}",
+                        name=f"{str(day)} - {'Sensor' if '_outdoor' not in column and '_felt' not in column else 'Outdoor' if '_outdoor' in column else 'Felt'}",
                         line_shape="spline" if chart_type == "line" else None,
                         mode="lines" if chart_type == "line" else "markers",
                         line=dict(color=colorscale_dict[column][day_index])
