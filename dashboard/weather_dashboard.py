@@ -5,14 +5,13 @@ import plotly.io as pio
 import sqlite3
 import openmeteo_requests
 import requests_cache
-import pandas as pd
+import polars as pl
 import pytz
 import boto3
 import os
 import threading
 import time
 import queue
-import math
 from dash import dcc, html, clientside_callback
 from dash.dependencies import Output, Input, State
 from plotly.subplots import make_subplots
@@ -44,8 +43,8 @@ notification_cooldown = timedelta(minutes=15)
 
 class DatabaseHandler:
     def __init__(self):
-        self.today_df = pd.DataFrame(
-            columns=["Time", "Temperature", "Humidity", "eCO2"]
+        self.today_df = pl.DataFrame(
+            {"Time": [], "Temperature": [], "Humidity": [], "eCO2": []}
         )
         self.today_date_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -62,16 +61,14 @@ class DatabaseHandler:
                         ProjectionExpression="#dt, Temperature, Humidity, eCO2",
                     )
                     items = response.get("Items", [])
-                    df = normalize_aws_df(pd.DataFrame(items))
-
+                    df = normalize_aws_df(pl.DataFrame(items))
                     if query_date_str == self.today_date_str:
-                        self.today_df = df.copy()
-
+                        self.today_df = df.clone()
                     return df
                 except Exception as e:
                     print(f"Error fetching data for {query_date_str} from AWS: {e}")
-                    return pd.DataFrame(
-                        columns=["Time", "Temperature", "Humidity", "eCO2"]
+                    return pl.DataFrame(
+                        {"Time": [], "Temperature": [], "Humidity": [], "eCO2": []}
                     )
 
             self._fetch_day_data_aws_cached = fetch_day_data_aws_cached
@@ -84,24 +81,28 @@ class DatabaseHandler:
                 print(f"DB HIT (Local): Fetching data for date {query_date_str}")
                 try:
                     query = f"SELECT Time as datetime, Temperature, Humidity, eCO2 FROM weather_data WHERE DATE(Time) = '{query_date_str}'"
-                    df = pd.read_sql_query(query, self.conn)
-                    if df.empty:
-                        return pd.DataFrame(
-                            columns=["Time", "Temperature", "Humidity", "eCO2"]
+                    df = pl.read_database_uri(
+                        query,
+                        f"sqlite://{self.conn.execute('PRAGMA database_list').fetchone()[2]}",
+                    )
+                    if df.is_empty():
+                        return pl.DataFrame(
+                            {"Time": [], "Temperature": [], "Humidity": [], "eCO2": []}
                         )
 
                     for col in ["Temperature", "Humidity", "eCO2"]:
-                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                        if col in df.columns:
+                            df = df.with_columns(pl.col(col).cast(pl.Float64))
 
                     if query_date_str == self.today_date_str:
-                        self.today_df = df.copy()
+                        self.today_df = df.clone()
                     return df
                 except Exception as e:
                     print(
                         f"Error fetching data for {query_date_str} from Local DB: {e}"
                     )
-                    return pd.DataFrame(
-                        columns=["Time", "Temperature", "Humidity", "eCO2"]
+                    return pl.DataFrame(
+                        {"Time": [], "Temperature": [], "Humidity": [], "eCO2": []}
                     )
 
             self._fetch_day_data_local_cached = fetch_day_data_local_cached
@@ -124,8 +125,8 @@ class DatabaseHandler:
         if current_date_str != self.today_date_str:
             print(f"Date rolled over from {self.today_date_str} to {current_date_str}")
             self.today_date_str = current_date_str
-            self.today_df = pd.DataFrame(
-                columns=["Time", "Temperature", "Humidity", "eCO2"]
+            self.today_df = pl.DataFrame(
+                {"Time": [], "Temperature": [], "Humidity": [], "eCO2": []}
             )
             self._fetch_data_for_day(self.today_date_str)
 
@@ -136,9 +137,9 @@ class DatabaseHandler:
 
         if query_date_str == self.today_date_str:
             use_cached_today = False
-            if not self.today_df.empty and "Time" in self.today_df.columns:
+            if not self.today_df.is_empty() and "Time" in self.today_df.columns:
                 try:
-                    latest_time = pd.to_datetime(self.today_df["Time"]).max()
+                    latest_time = self.today_df["Time"].max()
                     time_diff = datetime.now() - latest_time
                     if time_diff.total_seconds() / 60 < 3:
                         # print("Using in-memory today_df - last update less than 3 minutes ago")
@@ -147,7 +148,7 @@ class DatabaseHandler:
                     print(f"Error comparing times for today's cache: {e}")
 
             if use_cached_today:
-                return self.today_df.copy()
+                return self.today_df.clone()
 
             else:
                 print(
@@ -167,11 +168,13 @@ class DatabaseHandler:
         self._check_date_rollover()
 
         if new_record_dict.get("date") == self.today_date_str:
-            new_row_df = normalize_aws_df(pd.DataFrame([new_record_dict]))
-        if not new_row_df.empty:
-            self.today_df = pd.concat([self.today_df, new_row_df], ignore_index=True)
-            self.today_df.sort_values(by="Time", inplace=True)
-            self.today_df.drop_duplicates(subset=["Time"], keep="last", inplace=True)
+            new_row_df = normalize_aws_df(pl.DataFrame([new_record_dict]))
+            if not new_row_df.is_empty():
+                self.today_df = pl.concat(
+                    [self.today_df, new_row_df], how="diagonal_relaxed"
+                )
+                self.today_df = self.today_df.sort("Time")
+                self.today_df = self.today_df.unique(subset=["Time"], keep="last")
 
     def get_latest_values(self):
         """Gets the most recent data point for the current day from internal df or DB."""
@@ -180,24 +183,28 @@ class DatabaseHandler:
         if DB_TYPE == "LOCAL":
             query = "SELECT * FROM weather_data ORDER BY Time DESC LIMIT 1"
             try:
-                df = pd.read_sql_query(query, self.conn)
-                if not df.empty:
-                    df["Time"] = pd.to_datetime(df["Time"])
-                    return df.iloc[0]
+                df = pl.read_database_uri(
+                    query,
+                    f"sqlite://{self.conn.execute('PRAGMA database_list').fetchone()[2]}",
+                )
+                if not df.is_empty():
+                    return df.row(0, named=True)
                 return None
             except Exception as e:
                 print(f"Error fetching latest value from Local DB: {e}")
                 return None
 
         # For AWS, rely on the internal today_df first
-        if not self.today_df.empty:
-            return self.today_df.iloc[-1].copy()
+        if not self.today_df.is_empty():
+            row_dict = self.today_df[-1:].to_dicts()
+            return row_dict[0] if row_dict else None
 
         # If today_df is empty, fetch from DB
         else:
             latest_from_db = self._fetch_data_for_day(self.today_date_str)
-            if not latest_from_db.empty:
-                return latest_from_db.iloc[-1].copy()
+            if not latest_from_db.is_empty():
+                row_dict = latest_from_db[-1:].to_dicts()
+                return row_dict[0] if row_dict else None
             return None
 
     def get_data(self, start_date_str, end_date_str):
@@ -210,14 +217,14 @@ class DatabaseHandler:
         while current_date <= end_date:
             current_date_str = current_date.strftime("%Y-%m-%d")
             day_df = self._fetch_data_for_day(current_date_str)
-            if not day_df.empty:
+            if not day_df.is_empty():
                 all_data.append(day_df)
             current_date += timedelta(days=1)
 
         if not all_data:
-            return pd.DataFrame()
+            return pl.DataFrame()
 
-        df = pd.concat(all_data, ignore_index=True)
+        df = pl.concat(all_data, how="diagonal_relaxed")
         return df
 
     def get_all_historical_data(self):
@@ -231,7 +238,7 @@ class DatabaseHandler:
             print(f"Attempting to fetch historical data for: {query_date_str}")
             day_df = self._fetch_data_for_day(query_date_str)  # Use the cache
 
-            if day_df.empty:
+            if day_df.is_empty():
                 print(f"No more historical data found before {query_date_str}.")
                 break
 
@@ -241,14 +248,14 @@ class DatabaseHandler:
             current_query_date -= timedelta(days=1)
 
         if not all_data:
-            return pd.DataFrame()
+            return pl.DataFrame()
 
-        df = pd.concat(all_data, ignore_index=True)
+        df = pl.concat(all_data, how="diagonal_relaxed")
         return df
 
     def get_data_by_timerange(self, time_range):
         """Get data based on predefined ranges."""
-        final_df = pd.DataFrame()
+        final_df = pl.DataFrame()
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d")
 
@@ -263,14 +270,18 @@ class DatabaseHandler:
         elif time_range > 1:  # All time
             historical_df = self.get_all_historical_data()
             self.today_df = self._fetch_data_for_day(today_str)
-            final_df = pd.concat([historical_df, self.today_df], ignore_index=True)
+            final_df = pl.concat([historical_df, self.today_df], how="diagonal_relaxed")
 
-        if not final_df.empty:
+        if not final_df.is_empty():
             final_df = normalize_aws_df(final_df)
 
-            if time_range >= 1 and not final_df.empty:
-                min_date_in_df = final_df["Time"].dt.date.min()
-                final_df = final_df[final_df["Time"].dt.date != min_date_in_df]
+            if time_range >= 1 and not final_df.is_empty():
+                min_date_in_df = final_df.select(
+                    pl.col("Time").cast(pl.Date).min()
+                ).item()
+                final_df = final_df.filter(
+                    pl.col("Time").cast(pl.Date) != min_date_in_df
+                )
 
         return final_df
 
@@ -281,17 +292,22 @@ class DatabaseHandler:
 
 def normalize_aws_df(aws_df):
     try:
-        aws_df["Time"] = pd.to_datetime(aws_df["datetime"])
-    except KeyError:
-        aws_df["Time"] = pd.to_datetime(aws_df["Time"])
+        aws_df = aws_df.with_columns(
+            pl.col("datetime").str.to_datetime("%Y-%m-%d %H:%M:%S").alias("Time")
+        )
+    except pl.exceptions.ColumnNotFoundError:
+        pass
 
-    aws_df.drop(columns=["datetime", "date", "TVOC"], inplace=True, errors="ignore")
-
+    aws_df = aws_df.drop(["datetime", "date", "TVOC"], strict=False)
+    # Ensure Time column is datetime if it exists
+    if "Time" in aws_df.columns:
+        if aws_df["Time"].dtype != pl.Datetime:
+            aws_df = aws_df.with_columns(pl.col("Time").cast(pl.Datetime))
     for col in ["Temperature", "Humidity", "eCO2"]:
         if col in aws_df.columns:
-            aws_df[col] = pd.to_numeric(aws_df[col])
+            aws_df = aws_df.with_columns(pl.col(col).cast(pl.Float64))
 
-    aws_df.sort_values(by="Time", inplace=True)
+    aws_df = aws_df.sort("Time")
     return aws_df
 
 
@@ -361,32 +377,25 @@ def start_stream_listener(db_handler, data_queue):
         print("Stream listener already running.")
 
 
-def calculate_felt_temperature(temp_celsius, humidity_percent):
+def add_felt_temperature_column(
+    df: pl.DataFrame, temp_col: str, rh_col: str
+) -> pl.DataFrame:
     """
-    Calculate felt temperature (wet-bulb temperature) using the provided formula.
-
-    Formula: Tw = T*arctan(0.151977*RH + 8.313659) + 0.00391838*RH^3*arctan(0.023101*RH)
-                  - arctan(RH - 1.676331) + arctan(T + RH) - 4.686035
-
-    Args:
-        temp_celsius: Air temperature in Celsius
-        humidity_percent: Relative humidity in percent (0-100)
-
-    Returns:
-        Felt temperature in Celsius
+    Adds a 'felt_temperature' column to the provided Polars DataFrame.
     """
-    T = temp_celsius
-    RH = humidity_percent
+    # Define T and RH for readability within the expression
+    T = pl.col(temp_col)
+    RH = pl.col(rh_col)
 
-    felt_temp = (
-        T * math.atan(0.151977 * RH + 8.313659)
-        + 0.00391838 * (RH**3) * math.atan(0.023101 * RH)
-        - math.atan(RH - 1.676331)
-        + math.atan(T + RH)
+    felt_temp_expr = (
+        T * (0.151977 * RH + 8.313659).arctan()
+        + 0.00391838 * (RH**3) * (0.023101 * RH).arctan()
+        - (RH - 1.676331).arctan()
+        + (T + RH).arctan()
         - 4.686035
-    )
+    ).alias("felt_temperature")
 
-    return felt_temp
+    return df.with_columns(felt_temp_expr)
 
 
 pio.templates.default = "plotly_dark"
@@ -604,7 +613,11 @@ clientside_callback(
 @cache.memoize()
 def get_outdoor_weather(time_range, _=None):
     """Retrieves and caches outdoor weather data in memory using Flask-Caching."""
-    min_date = db.get_data_by_timerange(time_range)["Time"].min().date()
+    data_range = db.get_data_by_timerange(time_range)
+    if data_range.is_empty():
+        min_date = datetime.now().date()
+    else:
+        min_date = data_range.select(pl.col("Time").cast(pl.Date).min()).item()
     current_date = datetime.now().date()
     now = datetime.now()
 
@@ -632,27 +645,37 @@ def get_outdoor_weather(time_range, _=None):
                 pytz.timezone(response.Timezone()).utcoffset(now).total_seconds()
             )
 
-            return pd.DataFrame(
-                {
-                    "Time": pd.date_range(
-                        start=pd.to_datetime(data_forecast.Time(), unit="s")
-                        + pd.Timedelta(seconds=timezone_offset),
-                        end=pd.to_datetime(data_forecast.TimeEnd(), unit="s")
-                        + pd.Timedelta(seconds=timezone_offset),
-                        freq=pd.Timedelta(seconds=data_forecast.Interval()),
-                        inclusive="left",
-                    ),
-                    "Temperature": data_forecast.Variables(0).ValuesAsNumpy(),
-                    "Humidity": data_forecast.Variables(1).ValuesAsNumpy(),
-                    # 'Precipitation': data_forecast.Variables(2).ValuesAsNumpy()
-                }
-            ).dropna()
+            start_time = datetime.fromtimestamp(
+                data_forecast.Time(), tz=pytz.utc
+            ) + timedelta(seconds=timezone_offset)
+            end_time = datetime.fromtimestamp(
+                data_forecast.TimeEnd(), tz=pytz.utc
+            ) + timedelta(seconds=timezone_offset)
+            interval = int(data_forecast.Interval())
+
+            times = []
+            current = start_time
+            while current < end_time:
+                times.append(current)
+                current += timedelta(seconds=interval)
+
+            return (
+                pl.DataFrame(
+                    {
+                        "Time": times,
+                        "Temperature": data_forecast.Variables(0).ValuesAsNumpy(),
+                        "Humidity": data_forecast.Variables(1).ValuesAsNumpy(),
+                    }
+                )
+                .with_columns(pl.col("Time").cast(pl.Datetime))
+                .drop_nulls()
+            )
         except Exception as e:
             print(f"Error fetching today's weather data: {e}")
-            return pd.DataFrame(columns=["Time", "Temperature", "Humidity"])
+            return pl.DataFrame(columns=["Time", "Temperature", "Humidity"])
 
     # Load full dataset from cache
-    outdoor_data = pd.DataFrame(columns=["Time", "Temperature", "Humidity"])
+    outdoor_data = pl.DataFrame(columns=["Time", "Temperature", "Humidity"])
 
     try:
         print("Historical weather data refetched")
@@ -674,35 +697,48 @@ def get_outdoor_weather(time_range, _=None):
             pytz.timezone(response.Timezone()).utcoffset(now).total_seconds()
         )
 
-        historical_data = pd.DataFrame(
-            {
-                "Time": pd.date_range(
-                    start=pd.to_datetime(data_historical.Time(), unit="s")
-                    + pd.Timedelta(seconds=timezone_offset),
-                    end=pd.to_datetime(data_historical.TimeEnd(), unit="s")
-                    + pd.Timedelta(seconds=timezone_offset),
-                    freq=pd.Timedelta(seconds=data_historical.Interval()),
-                    inclusive="left",
-                ),
-                "Temperature": data_historical.Variables(0).ValuesAsNumpy(),
-                "Humidity": data_historical.Variables(1).ValuesAsNumpy(),
-                # 'Precipitation': data_historical.Variables(2).ValuesAsNumpy()
-            }
-        ).dropna()
+        start_time = datetime.fromtimestamp(
+            data_historical.Time(), tz=pytz.utc
+        ) + timedelta(seconds=timezone_offset)
+        end_time = datetime.fromtimestamp(
+            data_historical.TimeEnd(), tz=pytz.utc
+        ) + timedelta(seconds=timezone_offset)
+        interval = int(data_historical.Interval())
+
+        times = []
+        current = start_time
+        while current < end_time:
+            times.append(current)
+            current += timedelta(seconds=interval)
+
+        historical_data = (
+            pl.DataFrame(
+                {
+                    "Time": times,
+                    "Temperature": data_historical.Variables(0).ValuesAsNumpy(),
+                    "Humidity": data_historical.Variables(1).ValuesAsNumpy(),
+                }
+            )
+            .with_columns(pl.col("Time").cast(pl.Datetime))
+            .drop_nulls()
+        )
 
         # Load today's data from forecast
         today_data = fetch_today_data()
 
-        full_data = pd.concat([historical_data, today_data])
+        full_data = pl.concat([historical_data, today_data], how="diagonal_relaxed")
 
-        full_data["Time"] = pd.to_datetime(full_data["Time"])
-        outdoor_data = full_data.sort_values(by="Time")
+        outdoor_data = full_data.sort("Time").unique(subset=["Time"], keep="first")
 
     except Exception as e:
         print(f"Error fetching outdoor weather data: {e}")
-        return pd.DataFrame(columns=["Time", "Temperature", "Humidity"])
+        return pl.DataFrame(columns=["Time", "Temperature", "Humidity"])
 
-    return outdoor_data.drop_duplicates()
+    # Ensure Time is datetime
+    if "Time" in outdoor_data.columns and outdoor_data["Time"].dtype != pl.Datetime:
+        outdoor_data = outdoor_data.with_columns(pl.col("Time").cast(pl.Datetime))
+
+    return outdoor_data
 
 
 # If the full time range is used, the granularity is reduced to avoid loading too many data points.
@@ -783,8 +819,8 @@ def process_new_data_for_graphs(n_intervals):
     try:
         updated = False
         while not new_data_queue.empty():
-            new_record = new_data_queue.get_nowait()
-            # print(f"Processing new record from queue for graphs: {new_record}")
+            _ = new_data_queue.get_nowait()
+            # print(f"Processing new record from queue for graphs: {_}")
             updated = True
 
         # Return a timestamp to trigger the graph update callback if there are updates
@@ -822,29 +858,59 @@ def update_daily_graph(
 
     if include_outdoor:
         df_outdoor = get_outdoor_weather(time_range, datetime.now().date())
-        # interpolate outdoor data according to granularity
+        # Ensure Time is datetime before truncate
+        if "Time" in df_outdoor.columns and df_outdoor["Time"].dtype != pl.Datetime:
+            df_outdoor = df_outdoor.with_columns(pl.col("Time").cast(pl.Datetime))
+        # resample outdoor data according to granularity
         df_outdoor = (
-            df_outdoor.set_index("Time")
-            .resample(str(granularity) + "s")
-            .interpolate()
-            .reset_index()
-        )
-        df = df.sort_values("Time")
-        df = pd.merge_asof(
-            df, df_outdoor, on="Time", suffixes=("", "_outdoor"), direction="nearest"
+            df_outdoor.with_columns(
+                pl.col("Time").dt.truncate(f"{granularity}s").alias("Time_bucket")
+            )
+            .group_by("Time_bucket")
+            .agg([pl.col("Temperature").mean(), pl.col("Humidity").mean()])
+            .sort("Time_bucket")
+            .with_columns(pl.col("Time_bucket").alias("Time"))
+            .drop("Time_bucket")
         )
 
-    df = df.set_index("Time").resample(str(granularity) + "s").median().reset_index()
-    df["clock_time"] = df["Time"].dt.time
+        df = df.sort("Time")
+        df = df.join_asof(
+            df_outdoor, on="Time", by_strategy="nearest_left", suffix="_outdoor"
+        )
 
-    unique_days = df["Time"].dt.date.unique()
-    n_days = df["Time"].dt.dayofyear.nunique()
+    # Ensure Time is datetime before truncate
+    if "Time" in df.columns and df["Time"].dtype != pl.Datetime:
+        df = df.with_columns(pl.col("Time").cast(pl.Datetime))
+
+    df = (
+        df.with_columns(
+            pl.col("Time").dt.truncate(f"{granularity}s").alias("Time_bucket")
+        )
+        .group_by("Time_bucket")
+        .agg(
+            [
+                pl.col("Temperature").median(),
+                pl.col("Humidity").median(),
+                pl.col("eCO2").median(),
+            ]
+        )
+        .sort("Time_bucket")
+        .with_columns(pl.col("Time_bucket").alias("Time"))
+        .drop("Time_bucket")
+    )
+
+    df = df.with_columns(pl.col("Time").dt.time().alias("clock_time"))
+
+    unique_days = df.select(pl.col("Time").dt.date().unique()).to_series().to_list()
+    n_days = len(
+        df.select(pl.col("Time").dt.ordinal_day().unique()).to_series().unique()
+    )
 
     temp_range = [df["Temperature"].min() * 0.8, df["Temperature"].max() * 1.1]
     hum_range = [df["Humidity"].min() * 0.8, df["Humidity"].max() * 1.1]
     eCO2_range = [df["eCO2"].min() * 0.8, df["eCO2"].max() * 1.1]
 
-    if include_outdoor:
+    if include_outdoor and "Temperature_outdoor" in df.columns:
         temp_range = [
             min(temp_range[0], df["Temperature_outdoor"].min() * 0.8),
             max(temp_range[1], df["Temperature_outdoor"].max() * 1.1),
@@ -855,9 +921,15 @@ def update_daily_graph(
         ]
 
     if include_felt_temp:
-        df["Temperature_felt"] = df.apply(
-            lambda row: calculate_felt_temperature(row["Temperature"], row["Humidity"]),
-            axis=1,
+        df = df.with_columns(
+            pl.struct(["Temperature", "Humidity"])
+            .map_elements(
+                lambda row: calculate_felt_temperature(
+                    row["Temperature"], row["Humidity"]
+                ),
+                return_dtype=pl.Float64,
+            )
+            .alias("Temperature_felt")
         )
         temp_range = [
             min(temp_range[0], df["Temperature_felt"].min() * 0.8),
@@ -921,10 +993,12 @@ def update_daily_graph(
         figures[column] = go.Figure()
         if aggregation_type == "median":
             if chart_type == "box":
+                clock_times = df["clock_time"].to_list()
+                values = df[column].to_list()
                 figures[column].add_trace(
                     go.Box(
-                        x=df["clock_time"],
-                        y=df[column],
+                        x=clock_times,
+                        y=values,
                         name=f"{column} (Sensor)"
                         if "_outdoor" not in column and "_felt" not in column
                         else f"{column.replace('_outdoor', '')} (Outdoor)"
@@ -934,10 +1008,12 @@ def update_daily_graph(
                 )
         elif aggregation_type == "full":
             if chart_type == "line":
+                times = df["Time"].to_list()
+                values = df[column].to_list()
                 figures[column].add_trace(
                     go.Scatter(
-                        x=df["Time"],
-                        y=df[column],
+                        x=times,
+                        y=values,
                         line_shape="spline",
                         name=f"{column} (Sensor)"
                         if "_outdoor" not in column and "_felt" not in column
@@ -948,17 +1024,19 @@ def update_daily_graph(
                 )
         elif aggregation_type == "stacked":
             for day_index, day in enumerate(unique_days):
-                df_day = df[df["Time"].dt.date == day]
+                df_day = df.filter(pl.col("Time").dt.date() == day)
                 if (
-                    not df_day[df_day["clock_time"].apply(lambda x: x.hour == 0)][
-                        column
-                    ]
-                    .isna()
-                    .all()
+                    not df_day.is_empty()
+                    and not df_day.filter(
+                        (pl.col("clock_time").dt.hour() == 0)
+                        & (pl.col(column).is_not_null())
+                    ).is_empty()
                 ):
+                    clock_times = df_day["clock_time"].to_list()
+                    values = df_day[column].to_list()
                     trace = go.Scatter(
-                        x=df_day["clock_time"],
-                        y=df_day[column],
+                        x=clock_times,
+                        y=values,
                         name=f"{str(day)} - {'Sensor' if '_outdoor' not in column and '_felt' not in column else 'Outdoor' if '_outdoor' in column else 'Felt'}",
                         line_shape="spline" if chart_type == "line" else None,
                         mode="lines" if chart_type == "line" else "markers",
