@@ -267,7 +267,12 @@ class DatabaseHandler:
             start_date_str = start_date.strftime("%Y-%m-%d")
             final_df = self.get_data(start_date_str, today_str)
 
-        elif time_range > 1:  # All time
+        elif time_range == 2:  # Current month
+            start_date = now.date() - timedelta(days=30)
+            start_date_str = start_date.strftime("%Y-%m-%d")
+            final_df = self.get_data(start_date_str, today_str)
+
+        elif time_range > 2:  # All time
             historical_df = self.get_all_historical_data()
             self.today_df = self._fetch_data_for_day(today_str)
             final_df = pl.concat([historical_df, self.today_df], how="diagonal_relaxed")
@@ -275,7 +280,7 @@ class DatabaseHandler:
         if not final_df.is_empty():
             final_df = normalize_aws_df(final_df)
 
-            if time_range >= 1 and not final_df.is_empty():
+            if time_range >= 2 and not final_df.is_empty():
                 min_date_in_df = final_df.select(
                     pl.col("Time").cast(pl.Date).min()
                 ).item()
@@ -406,7 +411,6 @@ pio.templates.default = "plotly_dark"
 
 
 dbc_css = "https://cdn.jsdelivr.net/gh/AnnMarieW/dash-bootstrap-templates/dbc.min.css"
-external_stylesheets = [dbc.themes.SOLAR, dbc_css]
 
 chart_theme = {
     "margin": dict(l=0, r=0, t=0, b=0),
@@ -419,9 +423,9 @@ chart_theme = {
 
 app = dash.Dash(
     __name__,
-    external_stylesheets=external_stylesheets,
+    external_stylesheets=[dbc.themes.SOLAR, dbc_css],
     title="Weather Dashboard",
-    meta_tags=[{"name": "viewport", "content": "margin=0"}],
+    meta_tags=[{"name": "viewport"}],
     update_title=None,
 )
 
@@ -495,12 +499,13 @@ app.layout = html.Div(
                                 dcc.Slider(
                                     id="current-time-range",
                                     min=0,
-                                    max=2,
-                                    step=1,
+                                    max=3,
+                                    step=None,
                                     marks={
                                         0: "Current Day",
                                         1: "Current Week",
-                                        2: "All",
+                                        2: "Current Month",
+                                        3: "All",
                                     },
                                     value=0,
                                 ),
@@ -564,9 +569,10 @@ app.layout = html.Div(
                 ),
             ],
             fluid=True,
-            className="dbc",
         ),
-    ]
+    ],
+    className="dbc",
+    style={"margin": "1%"},
 )
 
 # Update the browser title with the latest values
@@ -658,11 +664,9 @@ def get_outdoor_weather(time_range, _=None):
             )
             interval = int(data_forecast.Interval())
 
-            times = []
-            current = start_time
-            while current < end_time:
-                times.append(current)
-                current += timedelta(seconds=interval)
+            times = pl.datetime_range(
+                start_time, end_time, interval=f"{interval}s", eager=True, closed="left"
+            ).to_list()
 
             return (
                 pl.DataFrame(
@@ -724,11 +728,9 @@ def get_outdoor_weather(time_range, _=None):
         )
         interval = int(data_historical.Interval())
 
-        times = []
-        current = start_time
-        while current < end_time:
-            times.append(current)
-            current += timedelta(seconds=interval)
+        times = pl.datetime_range(
+            start_time, end_time, interval=f"{interval}s", eager=True, closed="left"
+        ).to_list()
 
         historical_data = (
             pl.DataFrame(
@@ -763,6 +765,12 @@ def get_outdoor_weather(time_range, _=None):
     if "Time" in outdoor_data.columns and outdoor_data["Time"].dtype != pl.Datetime:
         outdoor_data = outdoor_data.with_columns(pl.col("Time").cast(pl.Datetime))
 
+    # Cap outdoor data to 23:59:59 of the current day
+    current_date = datetime.now().date()
+    end_of_today = datetime.combine(current_date, datetime.max.time())
+    if not outdoor_data.is_empty():
+        outdoor_data = outdoor_data.filter(pl.col("Time") <= end_of_today)
+
     return outdoor_data
 
 
@@ -772,7 +780,7 @@ def get_outdoor_weather(time_range, _=None):
     [Input("current-time-range", "value"), Input("granularity-slider", "value")],
 )
 def update_granularity_slider(current_time_range, current_granularity):
-    if current_time_range == 2:
+    if current_time_range == 3:
         if current_granularity < 1800:
             return 1800
         else:
@@ -901,7 +909,23 @@ def update_daily_graph(
 
     if include_outdoor:
         df_outdoor = get_outdoor_weather(time_range, datetime.now().date())
+
+        # Create a complete time index covering both datasets at the specified granularity
+        min_time = df["Time"].min()
+        max_time = df_outdoor["Time"].max()
+
+        complete_times = pl.datetime_range(
+            min_time, max_time, interval=f"{granularity}s", eager=True, closed="left"
+        )
+        df_complete = pl.DataFrame({"Time": complete_times})
+
+        # Join sensor data to complete time index
+        df = df_complete.join(df, on="Time", how="left")
+
+        # Join outdoor data to complete time index
         df = df.join(df_outdoor, on="Time", how="left")
+
+        # Interpolate to fill gaps
         df = df.with_columns(
             [
                 pl.col("Temperature_outdoor").interpolate(),
