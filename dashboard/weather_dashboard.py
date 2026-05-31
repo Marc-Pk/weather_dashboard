@@ -643,10 +643,15 @@ def get_outdoor_weather(time_range, _=None):
             params = {
                 "latitude": LATITUDE,
                 "longitude": LONGITUDE,
-                "minutely_15": ["temperature_2m", "relative_humidity_2m"],
-                "timezone": "auto",
+                "minutely_15": [
+                    "temperature_2m",
+                    "relative_humidity_2m",
+                    "dew_point_2m",
+                ],
+                "timezone": "Europe/Berlin",
                 "past_days": 1,
                 "forecast_days": 1,
+                "models": "icon_d2",
             }
 
             responses = openmeteo.weather_api(url, params=params)
@@ -656,12 +661,13 @@ def get_outdoor_weather(time_range, _=None):
                 pytz.timezone(response.Timezone()).utcoffset(now).total_seconds()
             )
 
-            start_time = datetime.fromtimestamp(data_forecast.Time()) + timedelta(
-                seconds=timezone_offset
-            )
-            end_time = datetime.fromtimestamp(data_forecast.TimeEnd()) + timedelta(
-                seconds=timezone_offset
-            )
+            start_time = datetime.fromtimestamp(data_forecast.Time())  # + #timedelta(
+            #    seconds=timezone_offset
+            # )
+            end_time = datetime.fromtimestamp(data_forecast.TimeEnd())
+            # + timedelta(
+            #     seconds=timezone_offset
+            # )
             interval = int(data_forecast.Interval())
 
             times = pl.datetime_range(
@@ -707,10 +713,11 @@ def get_outdoor_weather(time_range, _=None):
         params = {
             "latitude": LATITUDE,
             "longitude": LONGITUDE,
-            "hourly": ["temperature_2m", "relative_humidity_2m"],
-            "timezone": "auto",
+            "hourly": ["temperature_2m", "relative_humidity_2m", "dew_point_2m"],
+            "timezone": "Europe/Berlin",
             "start_date": min_date - timedelta(days=6),
             "end_date": current_date - timedelta(days=2),
+            "models": "icon_d2",
         }
 
         responses = openmeteo.weather_api(url, params=params)
@@ -992,6 +999,20 @@ def update_daily_graph(
                 max(temp_range[1], t_dew_max * 1.1),
             ]
 
+    if include_outdoor and include_dew_point and "Temperature_outdoor" in df.columns:
+        df = df.with_columns(
+            calculate_dew_point(
+                pl.col("Temperature_outdoor"), pl.col("Humidity_outdoor")
+            ).alias("Temperature_dew_outdoor")
+        )
+        t_dew_out_min = df["Temperature_dew_outdoor"].min()
+        t_dew_out_max = df["Temperature_dew_outdoor"].max()
+        if t_dew_out_min is not None and t_dew_out_max is not None:
+            temp_range = [
+                min(temp_range[0], t_dew_out_min * 0.8),
+                max(temp_range[1], t_dew_out_max * 1.1),
+            ]
+
     # pre-define colors for the charts
     color_dict = {
         "Temperature": {"color": (239, 85, 59), "range": temp_range},
@@ -1000,6 +1021,7 @@ def update_daily_graph(
         "Temperature_outdoor": {"color": (255, 165, 0), "range": temp_range},
         "Humidity_outdoor": {"color": (0, 190, 255), "range": hum_range},
         "Temperature_dew": {"color": (200, 50, 50), "range": temp_range},
+        "Temperature_dew_outdoor": {"color": (210, 180, 140), "range": temp_range},
     }
 
     # fade from white to the color_dict values by the number of days
@@ -1035,6 +1057,10 @@ def update_daily_graph(
             f"rgb{fade_to_white(color_dict['Temperature_dew']['color'], day_index, n_days)}"
             for day_index in range(n_days)
         ],
+        "Temperature_dew_outdoor": [
+            f"rgb{fade_to_white(color_dict['Temperature_dew_outdoor']['color'], day_index, n_days)}"
+            for day_index in range(n_days)
+        ],
     }
 
     figures = {}
@@ -1044,6 +1070,8 @@ def update_daily_graph(
         columns_to_plot.extend(["Temperature_outdoor", "Humidity_outdoor"])
     if include_dew_point:
         columns_to_plot.append("Temperature_dew")
+    if include_outdoor and include_dew_point:
+        columns_to_plot.append("Temperature_dew_outdoor")
 
     for column in columns_to_plot:
         figures[column] = go.Figure()
@@ -1058,7 +1086,9 @@ def update_daily_graph(
                         name=f"{column} (Sensor)"
                         if "_outdoor" not in column and "_dew" not in column
                         else f"{column.replace('_outdoor', '')} (Outdoor)"
-                        if "_outdoor" in column
+                        if "_outdoor" in column and "_dew" not in column
+                        else "Dew Point (Outdoor)"
+                        if "_outdoor" in column and "_dew" in column
                         else "Dew Point",
                     )
                 )
@@ -1066,16 +1096,20 @@ def update_daily_graph(
             if chart_type == "line":
                 times = df["Time"].to_list()
                 values = df[column].to_list()
+                if "_outdoor" not in column and "_dew" not in column:
+                    trace_label = f"{column} (Sensor)"
+                elif "_outdoor" in column and "_dew" not in column:
+                    trace_label = f"{column.replace('_outdoor', '')} (Outdoor)"
+                elif "_outdoor" in column and "_dew" in column:
+                    trace_label = "Dew Point (Outdoor)"
+                else:
+                    trace_label = "Dew Point"
                 figures[column].add_trace(
                     go.Scatter(
                         x=times,
                         y=values,
                         line_shape="spline",
-                        name=f"{column} (Sensor)"
-                        if "_outdoor" not in column and "_dew" not in column
-                        else f"{column.replace('_outdoor', '')} (Outdoor)"
-                        if "_outdoor" in column
-                        else "Dew Point",
+                        name=trace_label,
                     )
                 )
         elif aggregation_type == "stacked":
@@ -1090,10 +1124,19 @@ def update_daily_graph(
                 ):
                     clock_times = df_day["clock_time"].to_list()
                     values = df_day[column].to_list()
+                    trace_label = f"{str(day)} - "
+                    if "_outdoor" not in column and "_dew" not in column:
+                        trace_label += "Sensor"
+                    elif "_outdoor" in column and "_dew" not in column:
+                        trace_label += "Outdoor"
+                    elif "_outdoor" in column and "_dew" in column:
+                        trace_label += "Outdoor Dew Point"
+                    else:
+                        trace_label += "Dew Point"
                     trace = go.Scatter(
                         x=clock_times,
                         y=values,
-                        name=f"{str(day)} - {'Sensor' if '_outdoor' not in column and '_dew' not in column else 'Outdoor' if '_outdoor' in column else 'Dew Point'}",
+                        name=trace_label,
                         line_shape="spline" if chart_type == "line" else None,
                         mode="lines" if chart_type == "line" else "markers",
                         line=dict(color=colorscale_dict[column][day_index])
@@ -1132,6 +1175,17 @@ def update_daily_graph(
                         trace.line.color = f"rgb{color_dict[dew_column]['color']}"
 
                     fig_merged.add_trace(trace, row=column_index + 1, col=1)
+
+            if include_outdoor and include_dew_point and column_name == "Temperature":
+                dew_outdoor_column = "Temperature_dew_outdoor"
+                if dew_outdoor_column in figures:
+                    for trace in figures[dew_outdoor_column].data:
+                        if aggregation_type != "stacked":
+                            trace.line.color = (
+                                f"rgb{color_dict[dew_outdoor_column]['color']}"
+                            )
+
+                        fig_merged.add_trace(trace, row=column_index + 1, col=1)
 
             fig_merged.update_yaxes(
                 title_text=column_name,
